@@ -14,6 +14,22 @@
 *.swp
 *~
 
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Profiles are per-machine artefacts. They record the absolute path of your
+# bottle and of the game's executable, which is your filesystem layout, not
+# anyone else's -- and a profile shared with those paths in it is wrong for
+# whoever receives it anyway. Keep your own; do not commit them. The format is
+# documented in profiles/README.md.
+/profiles/*.conf
+
 # Generated launchers and logs never belong in the repo
 *.app/
 *.log
+
+# ...except the stand-in CrossOver.app the tests need. A negation cannot
+# re-include a file whose parent directory is excluded, so this re-includes
+# the directory itself, not its contents.
+!tests/fixtures/fake-crossover/CrossOver.app/

@@ -1,0 +1,505 @@
+#!/bin/zsh
+# nvk-setup -- the guided front door. Runs the whole arc: check the machine,
+# configure a bottle, find a game, pick its executable, write a profile, and
+# generate the launchers.
+#
+#   nvk-setup                                   ask about everything
+#   nvk-setup --bottle Steam --game Deadlock    answer some of it up front
+#   nvk-setup --bottle Steam --game 1422450 --exe 'C:\...\game.exe' \
+#             --args '-dx11' --yes              answer all of it, no prompts
+#
+# Every question this asks can also be answered by a flag, so a working setup
+# can be reproduced as one command line, and a bug report can be a command
+# instead of a story.
+#
+# Options
+#   --bottle NAME        CrossOver bottle to use
+#   --game NAME|APPID    the game, by store name or appid
+#   --exe PATH           Windows path to the executable, skipping the picker
+#   --args STRING        launch arguments
+#   --needs-steam        make the game launcher start Steam itself
+#   --no-needs-steam     do not (the default: see the two-app split, below)
+#   --no-steam-app       do not generate the "Steam (NVK)" launcher
+#   --outdir DIR         where to put the .app (default ~/Applications)
+#   --profile-dir DIR    where profiles live (default ../profiles)
+#   --bottle-dir PATH    look for bottles here too
+#   --runtime PATH       Wine/NVK runtime
+#   --crossover PATH     CrossOver.app
+#   --d3d12              install vkd3d too, when setting the bottle up
+#   --dlss               install the runtime's DLSS DLLs too
+#   --dyld               put DYLD_LIBRARY_PATH in the bottle as well
+#   --skip-doctor        do not run the preflight check
+#   --skip-bottle-setup  assume the bottle is already configured
+#   --allow-anticheat    do not stop when the game ships anticheat
+#   --force              continue even if the preflight check fails
+#   --yes                never prompt; take the default or fail
+#   --dry-run            show what would happen; write nothing
+#   -h, --help
+#
+# The two-app split is the default: one launcher starts Steam under NVK, and a
+# second launches the game. Having the game launcher start Steam (--needs-steam)
+# is a convenience that does not work everywhere, because some games refuse to
+# run outside Steam's own process tree.
+#
+# Exit: 0 done, 1 error or refused, 2 finished with warnings.
+
+emulate -L zsh
+setopt no_unset pipe_fail
+
+# zsh sets $0 to the *function name* inside a function (FUNCTION_ARGZERO),
+# so the script's own path has to be captured out here, at the top level.
+SELF=${0:A}
+HERE=${SELF:h}
+NVK_DOCTOR=$HERE/nvk-doctor
+NVK_BOTTLE=$HERE/nvk-bottle
+NVK_STEAM=$HERE/nvk-steam
+NVK_WINEPATH=$HERE/nvk-winepath
+NVK_PROFILE=$HERE/nvk-profile
+NVK_MKAPP=$HERE/nvk-mkapp
+
+# --------------------------------------------------------------- options ---
+
+typeset opt_bottle='' opt_game='' opt_exe='' opt_args='' opt_outdir='' opt_profdir=''
+typeset opt_bottledir='' opt_runtime='' opt_crossover=''
+typeset opt_needs='' want_steam_app=yes assume_yes=no dry_run=no force=no
+typeset skip_doctor=no skip_setup=no want_d3d12=no want_dlss=no want_dyld=no
+typeset allow_anticheat=no
+typeset args_given=no
+
+die()  { print -r -- "nvk-setup: $*" >&2; exit 1 }
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//' }
+
+while (( $# )); do
+  case $1 in
+    --bottle)        (( $# >= 2 )) || die "--bottle needs a name"; opt_bottle=$2; shift 2 ;;
+    --bottle=*)      opt_bottle=${1#*=}; shift ;;
+    --game)          (( $# >= 2 )) || die "--game needs a name or appid"; opt_game=$2; shift 2 ;;
+    --game=*)        opt_game=${1#*=}; shift ;;
+    --exe)           (( $# >= 2 )) || die "--exe needs a path"; opt_exe=$2; shift 2 ;;
+    --exe=*)         opt_exe=${1#*=}; shift ;;
+    --args)          (( $# >= 2 )) || die "--args needs a value"; opt_args=$2; args_given=yes; shift 2 ;;
+    --args=*)        opt_args=${1#*=}; args_given=yes; shift ;;
+    --needs-steam)   opt_needs=yes; shift ;;
+    --no-needs-steam) opt_needs=no; shift ;;
+    --no-steam-app)  want_steam_app=no; shift ;;
+    --outdir)        (( $# >= 2 )) || die "--outdir needs a path"; opt_outdir=$2; shift 2 ;;
+    --outdir=*)      opt_outdir=${1#*=}; shift ;;
+    --profile-dir)   (( $# >= 2 )) || die "--profile-dir needs a path"; opt_profdir=$2; shift 2 ;;
+    --profile-dir=*) opt_profdir=${1#*=}; shift ;;
+    --bottle-dir)    (( $# >= 2 )) || die "--bottle-dir needs a path"; opt_bottledir=$2; shift 2 ;;
+    --bottle-dir=*)  opt_bottledir=${1#*=}; shift ;;
+    --runtime)       (( $# >= 2 )) || die "--runtime needs a path"; opt_runtime=$2; shift 2 ;;
+    --runtime=*)     opt_runtime=${1#*=}; shift ;;
+    --crossover)     (( $# >= 2 )) || die "--crossover needs a path"; opt_crossover=$2; shift 2 ;;
+    --crossover=*)   opt_crossover=${1#*=}; shift ;;
+    --d3d12)         want_d3d12=yes; shift ;;
+    --dlss)          want_dlss=yes; shift ;;
+    --dyld)          want_dyld=yes; shift ;;
+    --skip-doctor)   skip_doctor=yes; shift ;;
+    --skip-bottle-setup) skip_setup=yes; shift ;;
+    --allow-anticheat) allow_anticheat=yes; shift ;;
+    --force)         force=yes; shift ;;
+    --yes|-y)        assume_yes=yes; shift ;;
+    --dry-run)       dry_run=yes; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    *)               die "unknown option: $1 (try --help)" ;;
+  esac
+done
+
+(( EUID != 0 )) || die "do not run this as root"
+
+# Flags passed straight through to the primitives.
+typeset -a pass_dirs pass_rt pass_cx
+[[ -n $opt_bottledir ]] && pass_dirs=(--bottle-dir "$opt_bottledir")
+[[ -n $opt_runtime   ]] && pass_rt=(--runtime "$opt_runtime")
+[[ -n $opt_crossover ]] && pass_cx=(--crossover "$opt_crossover")
+
+# ------------------------------------------------------------------- ui ----
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  C_B=$'\033[1m'; C_D=$'\033[2m'; C_G=$'\033[32m'; C_Y=$'\033[33m'
+  C_R=$'\033[31m'; C_C=$'\033[36m'; C_0=$'\033[0m'
+else
+  C_B='' C_D='' C_G='' C_Y='' C_R='' C_C='' C_0=''
+fi
+
+step_n=0
+step()  { (( step_n++ )); print -r -- ""; print -r -- "${C_B}── ${step_n}. $* ──${C_0}" }
+info()  { print -r -- "   $*" }
+good()  { print -r -- "   ${C_G}✓${C_0} $*" }
+warn()  { print -r -- "   ${C_Y}!${C_0} $*" }
+bad()   { print -r -- "   ${C_R}✗${C_0} $*" }
+dim()   { print -r -- "   ${C_D}$*${C_0}" }
+
+# Ask a yes/no question. With --yes, take the default without asking.
+ask_yn() {  # $1 question, $2 default (y/n)
+  local q=$1 def=$2 ans
+  if [[ $assume_yes == yes ]]; then
+    [[ $def == y ]] && return 0 || return 1
+  fi
+  local hint='[y/N]'; [[ $def == y ]] && hint='[Y/n]'
+  while true; do
+    read -r "ans?   ${C_C}?${C_0} $q $hint " || return 1
+    [[ -z $ans ]] && ans=$def
+    case ${ans:l} in
+      y|yes) return 0 ;;
+      n|no)  return 1 ;;
+      *) info "please answer y or n" ;;
+    esac
+  done
+}
+
+# Numbered menu. Sets REPLY to the chosen index (1-based). With --yes, takes
+# the default. Returns 1 if the user asked to go back with "q".
+choose() {  # $1 prompt, $2 default index, rest: labels
+  # Not named "prompt": zsh ties that name to PS1. See the note by the game
+  # list about names the shell owns.
+  local _prompt=$1 def=$2; shift 2
+  local -a labels; labels=("$@")
+  local n=${#labels} ans
+  (( n )) || return 1
+  if (( n == 1 )); then REPLY=1; return 0; fi
+  if [[ $assume_yes == yes ]]; then REPLY=$def; return 0; fi
+  local i
+  for (( i = 1; i <= n; i++ )); do
+    if (( i == def )); then
+      print -r -- "     ${C_B}${i})${C_0} ${labels[i]} ${C_D}(default)${C_0}"
+    else
+      print -r -- "     ${i}) ${labels[i]}"
+    fi
+  done
+  while true; do
+    read -r "ans?   ${C_C}?${C_0} $_prompt [1-${n}, default ${def}] " || return 1
+    [[ -z $ans ]] && ans=$def
+    [[ $ans == q ]] && return 1
+    if [[ $ans == <-> ]] && (( ans >= 1 && ans <= n )); then REPLY=$ans; return 0; fi
+    info "please enter a number between 1 and $n"
+  done
+}
+
+ask_text() {  # $1 prompt, $2 default -> REPLY
+  local _prompt=$1 def=$2 ans
+  if [[ $assume_yes == yes ]]; then REPLY=$def; return 0; fi
+  if [[ -n $def ]]; then
+    read -r "ans?   ${C_C}?${C_0} $_prompt ${C_D}[$def]${C_0} " || return 1
+    [[ -z $ans ]] && ans=$def
+  else
+    read -r "ans?   ${C_C}?${C_0} $_prompt " || return 1
+  fi
+  REPLY=$ans
+}
+
+print -r -- "${C_B}nvk-setup${C_0} — CrossOver on native NVK"
+dim "Everything this asks can also be given as a flag; --help lists them."
+[[ $dry_run == yes ]] && warn "dry run: nothing will be written"
+
+exit_code=0
+
+# ------------------------------------------------------- 1. the machine ----
+
+step "Checking this machine"
+if [[ $skip_doctor == yes ]]; then
+  dim "skipped (--skip-doctor)"
+else
+  $NVK_DOCTOR --quiet $pass_rt $pass_cx
+  typeset rc=$?
+  case $rc in
+    0) good "preflight passed" ;;
+    2) warn "preflight passed with warnings (shown above)"
+       exit_code=2
+       if [[ $assume_yes != yes ]]; then
+         ask_yn "Continue anyway?" y || die "stopped at the preflight check"
+       fi ;;
+    *) bad "preflight failed"
+       dim "Run '${NVK_DOCTOR:t}' on its own for the full report."
+       [[ $force == yes ]] || die "refusing to continue; pass --force to override" ;;
+  esac
+fi
+
+# ---------------------------------------------------------- 2. the bottle --
+
+step "Choosing a bottle"
+typeset -a bottles
+bottles=("${(@f)$($NVK_BOTTLE $pass_dirs list 2>/dev/null)}")
+bottles=(${bottles:#})
+(( ${#bottles} )) || die "no CrossOver bottles found. Create one in CrossOver first."
+
+typeset bottle=''
+if [[ -n $opt_bottle ]]; then
+  if (( ${bottles[(I)$opt_bottle]} )); then
+    bottle=$opt_bottle
+  else
+    die "no bottle named '$opt_bottle'. Found: ${(j:, :)bottles}"
+  fi
+else
+  typeset def=1
+  (( ${bottles[(I)Steam]} )) && def=${bottles[(i)Steam]}
+  choose "Which bottle?" $def $bottles || die "cancelled"
+  bottle=${bottles[$REPLY]}
+fi
+typeset prefix
+prefix=$($NVK_BOTTLE $pass_dirs path "$bottle") || die "cannot locate bottle '$bottle'"
+good "bottle: $bottle"
+dim "$prefix"
+
+# ------------------------------------------------- 3. configure the bottle --
+
+step "Configuring the bottle for NVK"
+typeset configured=no
+grep -q 'managed by nvk-bottle' "$prefix/cxbottle.conf" 2>/dev/null && configured=yes
+
+if [[ $skip_setup == yes ]]; then
+  dim "skipped (--skip-bottle-setup)"
+  [[ $configured == no ]] && warn "this bottle does not look configured; the launcher will probably fail"
+elif [[ $configured == yes ]]; then
+  good "already configured"
+  dim "Re-run 'nvk-bottle setup $bottle' yourself if you want to change its options."
+else
+  warn "this bottle is not configured for NVK yet"
+  info "Setting it up installs the runtime's DXVK into the bottle and rewrites"
+  info "its cxbottle.conf (backing the original up first). Without this step a"
+  info "launcher will start the game on CrossOver's default path and fail with"
+  info "\"Failed to create DirectX 11 render device!\"."
+  info ""
+  info "It also needs the bottle's applications closed."
+  if [[ $dry_run == yes ]]; then
+    dim "dry run: would run  nvk-bottle setup $bottle"
+  elif ask_yn "Set up '$bottle' now?" y; then
+    typeset -a setup_flags
+    setup_flags=()
+    [[ $want_d3d12 == yes ]] && setup_flags+=(--d3d12)
+    [[ $want_dlss  == yes ]] && setup_flags+=(--dlss)
+    [[ $want_dyld  == yes ]] && setup_flags+=(--dyld)
+    [[ $assume_yes == yes ]] && setup_flags+=(--yes)
+    if $NVK_BOTTLE $pass_dirs $pass_rt $pass_cx setup "$bottle" $setup_flags; then
+      good "bottle configured"
+      configured=yes
+    else
+      die "bottle setup failed; nothing further was changed"
+    fi
+  else
+    warn "skipped; the launcher will probably fail until this is done"
+    exit_code=2
+  fi
+fi
+
+# ------------------------------------------------------------ 4. the game --
+
+step "Finding the game"
+typeset -a rows
+rows=("${(@f)$($NVK_STEAM $pass_dirs games "$bottle" 2>/dev/null)}")
+rows=(${rows:#})
+(( ${#rows} )) || die "no Steam games found in '$bottle'. Is Steam installed in this bottle?"
+
+# NOTE: zsh ties some names to the shell itself -- `path` IS `$PATH`, and
+# assigning a filename to it breaks every external command in this process.
+# Nothing here may be called path, cdpath, fpath, manpath or status.
+typeset -a labels ids names gdirs
+labels=() ids=() names=() gdirs=()
+typeset r appid gname installdir gdir present
+for r in $rows; do
+  IFS=$'\t' read -r appid gname installdir gdir present <<< "$r"
+  [[ $present == yes ]] || continue
+  ids+=("$appid"); names+=("$gname"); gdirs+=("$gdir")
+  labels+=("$gname ${C_D}($appid)${C_0}")
+done
+(( ${#ids} )) || die "Steam lists games, but none of their folders are present."
+
+typeset pick=0
+if [[ -n $opt_game ]]; then
+  typeset i
+  for (( i = 1; i <= ${#ids}; i++ )); do
+    [[ ${ids[i]} == $opt_game ]] && { pick=$i; break }
+    [[ ${(L)names[i]} == ${(L)opt_game} ]] && { pick=$i; break }
+  done
+  if (( ! pick )); then
+    # Fall back to a substring match before giving up, since store names are
+    # long and nobody types "Counter-Strike 2" exactly.
+    for (( i = 1; i <= ${#ids}; i++ )); do
+      [[ ${(L)names[i]} == *${(L)opt_game}* ]] && { pick=$i; break }
+    done
+  fi
+  if (( ! pick )); then
+    bad "no installed game matches '$opt_game'"
+    info "Installed in this bottle:"
+    for (( i = 1; i <= ${#ids}; i++ )); do info "   ${names[i]} (${ids[i]})"; done
+    exit 1
+  fi
+else
+  choose "Which game?" 1 $labels || die "cancelled"
+  pick=$REPLY
+fi
+
+typeset game_id=${ids[pick]} game_name=${names[pick]} game_dir=${gdirs[pick]}
+good "game: $game_name ($game_id)"
+dim "$game_dir"
+
+# ------------------------------------------------------ 5. anticheat check --
+
+step "Checking for anticheat"
+typeset ac
+ac=$($NVK_STEAM anticheat "$game_dir" 2>/dev/null | head -5)
+typeset anticheat_name=''
+if [[ -n $ac ]]; then
+  anticheat_name=$(print -r -- "$ac" | head -1 | sed 's|.*/||')
+  bad "this game ships anticheat: $anticheat_name"
+  info "Kernel-level anticheat (EasyAntiCheat, BattlEye, Vanguard) does not work"
+  info "under Wine on macOS. Nothing in this project changes that. A launcher"
+  info "will be generated, but the game is not expected to run."
+  if [[ $allow_anticheat == yes ]]; then
+    warn "continuing anyway (--allow-anticheat)"
+  else
+    ask_yn "Continue anyway?" n || die "stopped; no launcher was generated (--allow-anticheat overrides this)"
+  fi
+  exit_code=2
+else
+  good "none detected"
+fi
+
+# ------------------------------------------------------ 6. the executable --
+
+step "Choosing the executable"
+typeset exe_win='' exe_unix=''
+if [[ -n $opt_exe ]]; then
+  exe_win=$opt_exe
+  good "executable: $exe_win"
+  dim "(given with --exe; not checked against what is installed)"
+else
+  typeset -a exerows
+  exerows=("${(@f)$($NVK_STEAM exes "$game_dir" 2>/dev/null)}")
+  exerows=(${exerows:#})
+  if (( ! ${#exerows} )); then
+    warn "no candidate executables found under the game's folder"
+    ask_text "Windows path to the executable" "" || die "cancelled"
+    [[ -n $REPLY ]] || die "no executable given"
+    exe_win=$REPLY
+  else
+    typeset -a exelabels exepaths
+    exelabels=() exepaths=()
+    typeset score size epath rel
+    for r in $exerows; do
+      IFS=$'\t' read -r score size epath <<< "$r"
+      rel=${epath#$game_dir/}
+      exepaths+=("$epath")
+      exelabels+=("$rel ${C_D}($(( size / 1024 )) KiB)${C_0}")
+    done
+    choose "Which executable?" 1 $exelabels || die "cancelled"
+    exe_unix=${exepaths[$REPLY]}
+    exe_win=$($NVK_WINEPATH $pass_dirs to-win "$bottle" "$exe_unix") \
+      || die "could not map $exe_unix to a Windows path"
+    good "executable: ${exe_unix#$game_dir/}"
+    dim "$exe_win"
+  fi
+fi
+
+# ----------------------------------------------------------- 7. arguments --
+
+step "Launch arguments"
+typeset args=''
+typeset existing_profile=''
+existing_profile=$($NVK_PROFILE ${opt_profdir:+--dir=$opt_profdir} path "$game_id" 2>/dev/null) || existing_profile=''
+if [[ $args_given == yes ]]; then
+  args=$opt_args
+  info "using --args"
+elif [[ -n $existing_profile ]]; then
+  args=$($NVK_PROFILE read "$existing_profile" args)
+  info "a profile for this game already exists: $existing_profile"
+  ask_text "Launch arguments" "$args" || die "cancelled"
+  args=$REPLY
+else
+  dim "Common ones: -dx11 for Source 2 games. Leave empty if unsure."
+  ask_text "Launch arguments" "" || die "cancelled"
+  args=$REPLY
+fi
+[[ -n $args ]] && good "arguments: $args" || good "no arguments"
+
+# --------------------------------------------------- 8. how it will launch --
+
+step "How the game should start"
+typeset needs_steam=no
+if [[ -n $opt_needs ]]; then
+  needs_steam=$opt_needs
+  info "set by flag"
+else
+  info "The default is two apps: one starts Steam under NVK, the other starts"
+  info "the game. The alternative is a single app that starts Steam itself,"
+  info "which is convenient but does not work for every game."
+  if ask_yn "Use the two-app split (recommended)?" y; then
+    needs_steam=no
+  else
+    needs_steam=yes
+    want_steam_app=no
+  fi
+fi
+[[ $needs_steam == yes ]] \
+  && good "one app, which starts Steam itself" \
+  || good "two apps: Steam (NVK) and the game"
+
+# ------------------------------------------------------------ 9. summary ---
+
+step "Summary"
+typeset profile_name profile_path
+profile_name=$($NVK_PROFILE name "$game_name" "$game_id")
+if [[ -n $opt_profdir ]]; then profile_path=$opt_profdir/$profile_name
+else profile_path=$HERE/../profiles/$profile_name; fi
+typeset outdir=${opt_outdir:-$HOME/Applications}
+
+info "bottle        $bottle"
+info "game          $game_name ($game_id)"
+info "executable    $exe_win"
+info "arguments     ${args:-(none)}"
+info "starts Steam  $needs_steam"
+[[ -n $anticheat_name ]] && info "anticheat     $anticheat_name (not expected to run)"
+info "profile       $profile_path"
+info "launchers     $outdir"
+[[ $want_steam_app == yes ]] && info "              + Steam (NVK).app"
+
+if [[ $dry_run == yes ]]; then
+  print -r -- ""
+  warn "dry run: stopping here, nothing was written"
+  exit $exit_code
+fi
+
+ask_yn "Write the profile and generate the launchers?" y || die "cancelled; nothing was written"
+
+# ----------------------------------------------------------- 10. generate --
+
+step "Writing"
+
+typeset -a pw
+pw=(schema=1 "appid=$game_id" "name=$game_name" "bottle=$bottle"
+    "bottle_dir=${prefix:h}" "exe_win=$exe_win" "args=$args"
+    "needs_steam=$needs_steam" "app_name=$game_name (NVK)")
+[[ -n $exe_unix       ]] && pw+=("exe_unix=$exe_unix")
+[[ -n $anticheat_name ]] && pw+=("anticheat=$anticheat_name")
+
+$NVK_PROFILE write "$profile_path" $pw >/dev/null || die "could not write $profile_path"
+good "profile: $profile_path"
+
+typeset -a mkflags
+mkflags=($pass_dirs $pass_rt $pass_cx --outdir "$outdir")
+
+if ! $NVK_MKAPP $mkflags --profile "$profile_path"; then
+  die "could not generate the game launcher"
+fi
+
+if [[ $want_steam_app == yes ]]; then
+  typeset steam_exe
+  steam_exe='C:\Program Files (x86)\Steam\steam.exe'
+  if ! $NVK_MKAPP $mkflags --bottle "$bottle" --app "$steam_exe" --name 'Steam (NVK)'; then
+    warn "could not generate the Steam launcher; the game launcher is still there"
+    exit_code=2
+  fi
+fi
+
+step "Done"
+if [[ $needs_steam == no && $want_steam_app == yes ]]; then
+  info "Start ${C_B}Steam (NVK)${C_0} first, wait for Steam to finish loading,"
+  info "then start ${C_B}$game_name (NVK)${C_0}."
+else
+  info "Start ${C_B}$game_name (NVK)${C_0}."
+fi
+dim "Logs: ~/Library/Logs/nvk-*.log"
+dim "If something is wrong, run 'nvk-doctor --bottle $bottle' and include its output."
+[[ -n $anticheat_name ]] && warn "Remember: $anticheat_name is not expected to work."
+exit $exit_code

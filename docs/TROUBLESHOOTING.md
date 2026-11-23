@@ -1,10 +1,29 @@
 # Troubleshooting
 
-Start with `bin/nvk-doctor`. It is read-only and its output is also what you
-should attach to any bug report.
+Start with `bin/nvk-doctor`. It is read-only, never needs sudo, and its output
+is also what you should attach to any bug report. Add `--bottle NAME` to check a
+bottle's DXVK and configuration too, or `--all-bottles` for every one it finds.
+
+Its exit status is the gate:
+
+| Status | Meaning |
+|---|---|
+| `0` | Everything required is present and correct. |
+| `2` | Usable, but at least one check wants attention. |
+| `1` | At least one fatal problem. Do not continue. |
+
+It compares the DXVK DLLs installed in a bottle against the runtime's own
+`SHA256SUMS`, so it stays correct across runtime updates rather than checking
+hashes written down when it was authored.
 
 Generated launchers log to `~/Library/Logs/nvk-<name>.log`. DXVK logs land in
 `<bottle>/drive_c/dxvk/`.
+
+If a launcher is wrong rather than broken — the wrong executable, missing
+arguments — fix its profile in `profiles/` and run `nvk-mkapp --profile
+<file>`, rather than editing the generated `.app`. The `.app` is an artefact;
+the profile is the record. `nvk-mkapp --regenerate-all` rebuilds every one of
+them, which is what to run after a runtime or CrossOver update.
 
 ---
 

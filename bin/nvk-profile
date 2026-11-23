@@ -1,0 +1,247 @@
+#!/bin/sh
+# nvk-profile -- read and write the per-game profiles that launchers are built
+# from.
+#
+#   nvk-profile list    [--dir DIR]
+#   nvk-profile path    <appid-or-slug> [--dir DIR]
+#   nvk-profile read    <file> [key]
+#   nvk-profile write   <file> key=value [key=value ...]
+#   nvk-profile validate <file>
+#   nvk-profile name    <name> [appid]        suggest a filename
+#
+# A profile is the output of record. The .app is generated from it, so after a
+# runtime or CrossOver update every launcher can be rebuilt in bulk instead of
+# being reconstructed from memory.
+#
+# Profiles are meant to be shared, so the format is flat key=value text that is
+# read line by line and NEVER sourced -- running a file someone sent you is
+# arbitrary code execution. For the same reason every value is treated as
+# hostile data by whatever interpolates it.
+#
+# Keys (schema 1):
+#   schema        required, "1"
+#   appid         Steam application id, if it came from Steam
+#   name          the game's name as its store spells it
+#   installdir    the folder Steam installed it into
+#   bottle        CrossOver bottle name
+#   bottle_dir    directory that bottle lives in, recorded for diagnosis
+#   exe_win       Windows path to the executable  (required)
+#   exe_unix      the same file as a unix path, recorded for diagnosis
+#   args          launch arguments, whitespace separated. An argument that
+#                 itself contains a space cannot be recorded here; nvk-mkapp
+#                 warns when that happens rather than losing it quietly.
+#   needs_steam   yes/no -- start Steam first and wait for it
+#   steam_app     Windows path to steam.exe, when it is not the default
+#   dxvk_config   DXVK_CONFIG contents for this game
+#   icon_from     an .app or directory to lift an .icns from
+#   app_name      the generated launcher's name, if not "<name> (NVK)"
+#   anticheat     anticheat this game ships, if any -- a warning, not a block
+#   notes         free text worth passing to the next person
+#
+# Values run to the end of the line, so they cannot contain a newline. Blank
+# lines and lines beginning with # are ignored.
+#
+# Exit: 0 success, 1 error, 2 validation failed.
+
+set -u
+
+PROFILE_DIR=
+# A literal newline. Command substitution strips trailing newlines, so it
+# cannot be used to build this.
+NL='
+'
+die() { printf 'nvk-profile: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; }
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+default_dir() {
+  [ -n "$PROFILE_DIR" ] && { printf '%s' "$PROFILE_DIR"; return 0; }
+  [ -n "${NVK_PROFILE_DIR:-}" ] && { printf '%s' "$NVK_PROFILE_DIR"; return 0; }
+  printf '%s' "$HERE/../profiles"
+}
+
+KNOWN_KEYS='schema appid name installdir bottle bottle_dir exe_win exe_unix args needs_steam steam_app dxvk_config icon_from app_name anticheat notes'
+
+# Read one key. Last definition wins, so an appended edit overrides an earlier
+# line without the file having to be rewritten.
+read_key() { # file key
+  awk -F= -v k="$2" '
+    /^[ \t]*#/ { next }
+    !/=/       { next }
+    {
+      key = $1; sub(/[ \t]+$/, "", key); sub(/^[ \t]+/, "", key)
+      if (key != k) next
+      val = substr($0, index($0, "=") + 1)
+      sub(/^[ \t]+/, "", val)
+      found = val
+      have = 1
+    }
+    END { if (have) print found }' "$1"
+}
+
+read_all() { # file -- every key=value, comments and blanks dropped
+  awk '
+    /^[ \t]*#/ { next }
+    /^[ \t]*$/ { next }
+    !/=/       { next }
+    { print }' "$1"
+}
+
+valid_key() {
+  case $1 in
+    ''|*[!a-z0-9_]*) return 1 ;;
+    [0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+cmd_read() {
+  [ -f "$1" ] || die "no such profile: $1"
+  if [ $# -ge 2 ]; then read_key "$1" "$2"; else read_all "$1"; fi
+}
+
+cmd_write() {
+  file=$1; shift
+  [ $# -ge 1 ] || die "write needs at least one key=value"
+  dir=$(dirname "$file")
+  [ -d "$dir" ] || mkdir -p "$dir" || die "cannot create $dir"
+  tmp=$(mktemp) || die "cannot create a temporary file"
+
+  # Start from what is already there, minus the keys being replaced.
+  if [ -f "$file" ]; then
+    drop=
+    for kv in "$@"; do
+      k=${kv%%=*}
+      valid_key "$k" || { rm -f "$tmp"; die "not a valid key: $k"; }
+      drop="$drop $k"
+    done
+    awk -v drop="$drop" '
+      BEGIN { n = split(drop, d, " "); for (i = 1; i <= n; i++) if (d[i] != "") kill[d[i]] = 1 }
+      /^[ \t]*#/ { print; next }
+      /^[ \t]*$/ { print; next }
+      !/=/       { print; next }
+      {
+        key = $0; sub(/=.*/, "", key); sub(/[ \t]+$/, "", key); sub(/^[ \t]+/, "", key)
+        if (!kill[key]) print
+      }' "$file" > "$tmp"
+  else
+    printf '# nvk profile -- read by nvk-mkapp, never sourced.\n' > "$tmp"
+  fi
+
+  for kv in "$@"; do
+    case $kv in *=*) ;; *) rm -f "$tmp"; die "expected key=value, got: $kv" ;; esac
+    k=${kv%%=*}; v=${kv#*=}
+    valid_key "$k" || { rm -f "$tmp"; die "not a valid key: $k"; }
+    # A newline would make the file unparseable; a tab is harmless but ugly.
+    case $v in
+      *"$NL"*) rm -f "$tmp"; die "value for '$k' contains a newline" ;;
+    esac
+    printf '%s=%s\n' "$k" "$v" >> "$tmp"
+  done
+
+  cat "$tmp" > "$file" && rm -f "$tmp" || { rm -f "$tmp"; die "cannot write $file"; }
+  printf '%s\n' "$file"
+}
+
+cmd_validate() {
+  file=$1
+  [ -f "$file" ] || die "no such profile: $file"
+  rc=0
+  say() { printf '%s: %s\n' "$file" "$*" >&2; rc=2; }
+
+  schema=$(read_key "$file" schema)
+  [ "$schema" = 1 ] || say "schema is '${schema:-unset}'; this tool understands schema 1"
+
+  for req in bottle exe_win; do
+    [ -n "$(read_key "$file" "$req")" ] || say "$req is required and is empty"
+  done
+
+  exe=$(read_key "$file" exe_win)
+  case $exe in
+    '' ) ;;
+    [a-zA-Z]:\\*) ;;
+    *) say "exe_win is not an absolute Windows path: $exe" ;;
+  esac
+
+  ns=$(read_key "$file" needs_steam)
+  case $ns in ''|yes|no) ;; *) say "needs_steam must be yes or no, not '$ns'" ;; esac
+
+  ai=$(read_key "$file" appid)
+  case $ai in ''|*[!0-9]*) [ -z "$ai" ] || say "appid is not numeric: $ai" ;; esac
+
+  # Unknown keys are a warning, not a failure: a newer profile may carry keys
+  # this version has not learned yet, and dropping them silently is worse.
+  read_all "$file" | while IFS= read -r l; do
+    k=${l%%=*}; k=$(printf '%s' "$k" | tr -d ' \t')
+    case " $KNOWN_KEYS " in
+      *" $k "*) ;;
+      *) printf '%s: note: unknown key "%s" (kept, but this version ignores it)\n' "$file" "$k" >&2 ;;
+    esac
+  done
+
+  [ "$rc" -eq 0 ] && printf '%s: ok\n' "$file"
+  return $rc
+}
+
+# A filename that is predictable, lowercase, and free of anything a shell or a
+# filesystem would argue about.
+cmd_name() {
+  slug=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+         | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//')
+  [ -n "$slug" ] || slug=game
+  if [ $# -ge 2 ] && [ -n "$2" ]; then printf '%s-%s.conf\n' "$slug" "$2"
+  else printf '%s.conf\n' "$slug"; fi
+}
+
+cmd_list() {
+  d=$(default_dir)
+  [ -d "$d" ] || return 0
+  for f in "$d"/*.conf; do
+    [ -f "$f" ] || continue
+    printf '%s\t%s\t%s\t%s\n' \
+      "$(read_key "$f" appid)" "$(read_key "$f" name)" "$(read_key "$f" bottle)" "$f"
+  done
+}
+
+cmd_path() {
+  d=$(default_dir)
+  for f in "$d"/*.conf; do
+    [ -f "$f" ] || continue
+    if [ "$(read_key "$f" appid)" = "$1" ]; then printf '%s\n' "$f"; return 0; fi
+    b=$(basename "$f" .conf)
+    if [ "$b" = "$1" ]; then printf '%s\n' "$f"; return 0; fi
+  done
+  return 1
+}
+
+ARGS=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --dir)   [ $# -ge 2 ] || die "--dir needs a path"; PROFILE_DIR=$2; shift 2 ;;
+    --dir=*) PROFILE_DIR=${1#*=}; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --)      shift; while [ $# -gt 0 ]; do ARGS="$ARGS
+$1"; shift; done ;;
+    -*)      die "unknown option: $1" ;;
+    *)       ARGS="$ARGS
+$1"; shift ;;
+  esac
+done
+
+oIFS=$IFS; IFS='
+'
+# shellcheck disable=SC2086
+set -- $ARGS
+IFS=$oIFS
+
+case "${1:-}" in
+  list)     shift; [ $# -eq 0 ] || die "usage: list [--dir DIR]"; cmd_list ;;
+  path)     shift; [ $# -eq 1 ] || die "usage: path <appid-or-slug>"
+            cmd_path "$1" || die "no profile for '$1' in $(default_dir)" ;;
+  read)     shift; [ $# -ge 1 ] || die "usage: read <file> [key]"; cmd_read "$@" ;;
+  write)    shift; [ $# -ge 2 ] || die "usage: write <file> key=value ..."; cmd_write "$@" ;;
+  validate) shift; [ $# -eq 1 ] || die "usage: validate <file>"; cmd_validate "$1" ;;
+  name)     shift; [ $# -ge 1 ] || die "usage: name <name> [appid]"; cmd_name "$@" ;;
+  ''|help)  usage; exit 1 ;;
+  *)        die "unknown command: $1 (try --help)" ;;
+esac

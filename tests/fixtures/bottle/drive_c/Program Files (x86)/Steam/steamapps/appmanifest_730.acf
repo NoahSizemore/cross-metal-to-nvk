@@ -1,0 +1,17 @@
+"AppState"
+{
+	"appid"		"730"
+	"Universe"		"1"
+	"LauncherPath"		"C:\\Program Files (x86)\\Steam\\steam.exe"
+	"name"		"Counter-Strike 2"
+	"StateFlags"		"4"
+	"installdir"		"Counter-Strike Global Offensive"
+	"InstalledDepots"
+	{
+		"12345"
+		{
+			"manifest"		"8590211232665907532"
+			"name"		"this nested name must not be mistaken for the game's"
+		}
+	}
+}

@@ -1,0 +1,23 @@
+"libraryfolders"
+{
+	"0"
+	{
+		"path"		"C:\\Program Files (x86)\\Steam"
+		"label"		""
+		"apps"
+		{
+			"730"		"35674515"
+			"228980"		"25674515"
+		}
+	}
+	"1"
+	{
+		"path"		"D:\\SteamLibrary"
+		"label"		"second drive"
+		"apps"
+		{
+			"1422450"		"39049299035"
+			"999001"		"12345"
+		}
+	}
+}

@@ -1,0 +1,17 @@
+"AppState"
+{
+	"appid"		"1422450"
+	"Universe"		"1"
+	"LauncherPath"		"C:\\Program Files (x86)\\Steam\\steam.exe"
+	"name"		"Deadlock"
+	"StateFlags"		"4"
+	"installdir"		"Deadlock"
+	"InstalledDepots"
+	{
+		"12345"
+		{
+			"manifest"		"8590211232665907532"
+			"name"		"this nested name must not be mistaken for the game's"
+		}
+	}
+}

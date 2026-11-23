@@ -1,13 +1,40 @@
 #!/bin/sh
-# Generate a double-clickable .app that launches a CrossOver game on native NVK.
+# nvk-mkapp -- generate a double-clickable .app that launches a CrossOver game
+# on native NVK, from a profile or from flags.
 #
-#   sh nvk-mkapp.sh --bottle Steam \
-#       --app 'C:\Program Files (x86)\Steam\steamapps\common\Deadlock\game\bin\win64\deadlock.exe' \
-#       --name 'Deadlock (NVK)' --args '-dx11' --needs-steam \
-#       --icon-from '/path/to/some.app'
+#   nvk-mkapp --profile profiles/deadlock-1422450.conf
+#   nvk-mkapp --regenerate-all
+#   nvk-mkapp --bottle Steam --app 'C:\...\deadlock.exe' --name 'Deadlock (NVK)' \
+#             --args '-dx11' --save-profile profiles/deadlock-1422450.conf
 #
-# The generated app logs everything to ~/Library/Logs/nvk-<name>.log and shows a
-# dialog if anything fails, because a GUI app has no terminal to print to.
+# Sources of settings, in increasing order of precedence: the profile, then
+# flags. So --profile X --args '-dx9' builds X with different arguments
+# without editing it.
+#
+# Options
+#   --profile FILE       read settings from this profile
+#   --regenerate-all     rebuild a launcher for every profile in the directory
+#   --profile-dir DIR    where profiles live (default ../profiles)
+#   --save-profile FILE  write these settings to a profile as well
+#   --bottle NAME        CrossOver bottle
+#   --app PATH           Windows path to the executable
+#   --name TEXT          the .app's name
+#   --args STRING        launch arguments, split on whitespace
+#   --arg VALUE          one argument, exactly as given (repeatable)
+#   --needs-steam        start Steam first and wait for it
+#   --no-needs-steam     do not (the default)
+#   --steam-app PATH     Windows path to steam.exe
+#   --dxvk-config TEXT   DXVK_CONFIG for this game
+#   --icon-from PATH     an .app or directory to lift an .icns from
+#   --outdir DIR         where to put the .app (default ~/Applications)
+#   --bottle-dir PATH    look for the bottle here too
+#   --runtime PATH       Wine/NVK runtime
+#   --crossover PATH     CrossOver.app
+#   --dry-run            print the launcher that would be generated; write nothing
+#   -h, --help
+#
+# The generated app logs to ~/Library/Logs/nvk-<slug>.log and raises a dialog on
+# failure, because a GUI app has no terminal to print to.
 #
 # Why a generated .app rather than patching CrossOver's own launchers:
 #   * CrossOver regenerates its launchers; edits there do not survive.
@@ -15,85 +42,241 @@
 #     environment must be set in the process that becomes the game, not
 #     inherited through Steam's helper chain.
 # Built on your machine => no quarantine attribute => no Gatekeeper prompt.
+#
+# Every value that reaches the generated script is quoted, and every value that
+# reaches the plist is XML-escaped, because profiles are meant to be shared and
+# game names contain quotes, ampersands and parentheses.
 
-set -eu
+set -u
 
-RUNTIME=/Library/GPUBundles/nvmtl/wine
-CX_ROOT='/Applications/CrossOver.app/Contents/SharedSupport/CrossOver'
-BOTTLE_DIRS="/Volumes/Storage/CrossOver/Bottles:$HOME/Library/Application Support/CrossOver/Bottles"
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SQ="'"
+
+RUNTIME=${NVK_RUNTIME:-/Library/GPUBundles/nvmtl/wine}
+CX_APP=${NVK_CROSSOVER:-/Applications/CrossOver.app}
 OUTDIR="$HOME/Applications"
+PROFILE_DIR=
+EXTRA_DIR=
+DRY_RUN=no
 
-bottle=''; app=''; name=''; args=''; needs_steam=no; icon_from=''; steam_app=''
+die() { printf 'nvk-mkapp: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'nvk-mkapp: %s\n' "$*" >&2; }
+usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; }
+
+[ "$(id -u)" = 0 ] && die "do not run this as root"
+
+# ------------------------------------------------------------- escaping ----
+# Single-quote a value for safe inclusion in generated shell. Every embedded
+# quote becomes '\'' -- the only form that is safe inside single quotes.
+shq() {
+  _v=$(printf '%s' "$1" | sed "s/$SQ/$SQ\\\\$SQ$SQ/g")
+  printf '%s%s%s' "$SQ" "$_v" "$SQ"
+}
+
+# A launcher is double-clicked from Finder, where the working directory is
+# not this one. Design rule 6: pin every path at generation time.
+abspath() {
+  case $1 in
+    /*) printf '%s' "$1" ;;
+    *)  if [ -d "$1" ]; then (CDPATH= cd -- "$1" && pwd -P)
+        else printf '%s/%s' "$(CDPATH= cd -- "$(dirname -- "$1")" && pwd -P)" "$(basename -- "$1")"
+        fi ;;
+  esac
+}
+
+xmlesc() {
+  printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
+}
+
+# ------------------------------------------------------------- settings ----
+# Empty means "not given". Flags are applied after the profile so they win.
+
+p_bottle=; p_app=; p_name=; p_args=; p_needs=; p_steamapp=; p_icon=; p_dxvk=
+p_appid=; p_gamename=; p_installdir=; p_anticheat=; p_notes=; p_exeunix=; p_bottledir=
+f_bottle=; f_app=; f_name=; f_args=; f_needs=; f_steamapp=; f_icon=; f_dxvk=
+f_args_given=no; f_arglist=; f_arglist_plain=
+PROFILE=; SAVE_PROFILE=; REGEN_ALL=no
+
+profile_dir() {
+  [ -n "$PROFILE_DIR" ] && { printf '%s' "$PROFILE_DIR"; return 0; }
+  printf '%s' "$HERE/../profiles"
+}
+
+load_profile() {
+  f=$1
+  [ -f "$f" ] || die "no such profile: $f"
+  "$HERE/nvk-profile" validate "$f" >/dev/null || die "profile failed validation: $f"
+  p_bottle=$("$HERE/nvk-profile" read "$f" bottle)
+  p_app=$("$HERE/nvk-profile" read "$f" exe_win)
+  p_name=$("$HERE/nvk-profile" read "$f" app_name)
+  p_args=$("$HERE/nvk-profile" read "$f" args)
+  p_needs=$("$HERE/nvk-profile" read "$f" needs_steam)
+  p_steamapp=$("$HERE/nvk-profile" read "$f" steam_app)
+  p_icon=$("$HERE/nvk-profile" read "$f" icon_from)
+  p_dxvk=$("$HERE/nvk-profile" read "$f" dxvk_config)
+  p_appid=$("$HERE/nvk-profile" read "$f" appid)
+  p_gamename=$("$HERE/nvk-profile" read "$f" name)
+  p_installdir=$("$HERE/nvk-profile" read "$f" installdir)
+  p_anticheat=$("$HERE/nvk-profile" read "$f" anticheat)
+  p_notes=$("$HERE/nvk-profile" read "$f" notes)
+  p_exeunix=$("$HERE/nvk-profile" read "$f" exe_unix)
+  p_bottledir=$("$HERE/nvk-profile" read "$f" bottle_dir)
+}
+
 while [ $# -gt 0 ]; do
   case $1 in
-    --bottle)      bottle=$2; shift 2 ;;
-    --app)         app=$2; shift 2 ;;
-    --name)        name=$2; shift 2 ;;
-    --args)        args=$2; shift 2 ;;
-    --needs-steam) needs_steam=yes; shift ;;
-    --steam-app)   steam_app=$2; shift 2 ;;
-    --icon-from)   icon_from=$2; shift 2 ;;
-    --outdir)      OUTDIR=$2; shift 2 ;;
-    *) echo "unknown option: $1" >&2; exit 1 ;;
+    --profile)        [ $# -ge 2 ] || die "--profile needs a file"; PROFILE=$2; shift 2 ;;
+    --profile=*)      PROFILE=${1#*=}; shift ;;
+    --regenerate-all) REGEN_ALL=yes; shift ;;
+    --profile-dir)    [ $# -ge 2 ] || die "--profile-dir needs a path"; PROFILE_DIR=$2; shift 2 ;;
+    --profile-dir=*)  PROFILE_DIR=${1#*=}; shift ;;
+    --save-profile)   [ $# -ge 2 ] || die "--save-profile needs a file"; SAVE_PROFILE=$2; shift 2 ;;
+    --save-profile=*) SAVE_PROFILE=${1#*=}; shift ;;
+    --bottle)         [ $# -ge 2 ] || die "--bottle needs a name"; f_bottle=$2; shift 2 ;;
+    --bottle=*)       f_bottle=${1#*=}; shift ;;
+    --app)            [ $# -ge 2 ] || die "--app needs a path"; f_app=$2; shift 2 ;;
+    --app=*)          f_app=${1#*=}; shift ;;
+    --name)           [ $# -ge 2 ] || die "--name needs a value"; f_name=$2; shift 2 ;;
+    --name=*)         f_name=${1#*=}; shift ;;
+    --args)           [ $# -ge 2 ] || die "--args needs a value"; f_args=$2; f_args_given=yes; shift 2 ;;
+    --args=*)         f_args=${1#*=}; f_args_given=yes; shift ;;
+    --arg)            [ $# -ge 2 ] || die "--arg needs a value"
+                      f_arglist="$f_arglist $(shq "$2")"
+                      f_arglist_plain="$f_arglist_plain $2"
+                      case $2 in
+                        *[" 	"]*|*\'*|*\"*)
+                          warn "argument '$2' contains whitespace or quotes; a profile stores arguments whitespace-separated and cannot record it faithfully" ;;
+                      esac
+                      f_args_given=yes; shift 2 ;;
+    --needs-steam)    f_needs=yes; shift ;;
+    --no-needs-steam) f_needs=no; shift ;;
+    --steam-app)      [ $# -ge 2 ] || die "--steam-app needs a path"; f_steamapp=$2; shift 2 ;;
+    --steam-app=*)    f_steamapp=${1#*=}; shift ;;
+    --dxvk-config)    [ $# -ge 2 ] || die "--dxvk-config needs a value"; f_dxvk=$2; shift 2 ;;
+    --dxvk-config=*)  f_dxvk=${1#*=}; shift ;;
+    --icon-from)      [ $# -ge 2 ] || die "--icon-from needs a path"; f_icon=$2; shift 2 ;;
+    --icon-from=*)    f_icon=${1#*=}; shift ;;
+    --bottle-dir)     [ $# -ge 2 ] || die "--bottle-dir needs a path"; EXTRA_DIR=$2; shift 2 ;;
+    --bottle-dir=*)   EXTRA_DIR=${1#*=}; shift ;;
+    --outdir)         [ $# -ge 2 ] || die "--outdir needs a path"; OUTDIR=$2; shift 2 ;;
+    --outdir=*)       OUTDIR=${1#*=}; shift ;;
+    --runtime)        [ $# -ge 2 ] || die "--runtime needs a path"; RUNTIME=$2; shift 2 ;;
+    --runtime=*)      RUNTIME=${1#*=}; shift ;;
+    --crossover)      [ $# -ge 2 ] || die "--crossover needs a path"; CX_APP=$2; shift 2 ;;
+    --crossover=*)    CX_APP=${1#*=}; shift ;;
+    --dry-run)        DRY_RUN=yes; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    *)                die "unknown option: $1 (try --help)" ;;
   esac
 done
-[ -n "$bottle" ] || { echo "--bottle is required" >&2; exit 1; }
-[ -n "$app" ]    || { echo "--app is required" >&2; exit 1; }
-[ -n "$name" ]   || name=$(basename "$app" .exe)
-[ -n "$steam_app" ] || steam_app='C:\Program Files (x86)\Steam\steam.exe'
 
-[ "$(id -u)" -ne 0 ] || { echo "do not run this as root" >&2; exit 1; }
-[ -x "$RUNTIME/bin/nvk-runtime" ] || { echo "NVK runtime missing: $RUNTIME" >&2; exit 1; }
-[ -x "$CX_ROOT/bin/wine" ] || { echo "CrossOver missing: $CX_ROOT" >&2; exit 1; }
+# --------------------------------------------------------- regenerate-all ---
 
-prefix=''
-IFS=:; for d in $BOTTLE_DIRS; do [ -d "$d/$bottle" ] && prefix="$d/$bottle"; done; unset IFS
-[ -n "$prefix" ] || { echo "bottle '$bottle' not found" >&2; exit 1; }
-
-slug=$(printf '%s' "$name" | tr -cd '[:alnum:]')
-bundle="$OUTDIR/$name.app"
-rm -rf "$bundle"
-mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-
-icon_line=''
-if [ -n "$icon_from" ]; then
-  src=$(find "$icon_from" -name '*.icns' 2>/dev/null | head -1 || true)
-  if [ -n "$src" ]; then
-    cp "$src" "$bundle/Contents/Resources/app.icns"
-    icon_line='  <key>CFBundleIconFile</key><string>app</string>'
-    echo "icon: $src"
-  else
-    echo "note: no .icns under $icon_from - using the default icon"
-  fi
+if [ "$REGEN_ALL" = yes ]; then
+  [ -z "$PROFILE" ] || die "--regenerate-all and --profile are mutually exclusive"
+  d=$(profile_dir)
+  [ -d "$d" ] || die "no profile directory at $d"
+  n=0; failed=0
+  for f in "$d"/*.conf; do
+    [ -f "$f" ] || continue
+    n=$((n + 1))
+    printf '=== %s\n' "$f"
+    if [ "$DRY_RUN" = yes ]; then dry=--dry-run; else dry=; fi
+    # shellcheck disable=SC2086
+    if "$0" --profile "$f" --outdir "$OUTDIR" --runtime "$RUNTIME" --crossover "$CX_APP" \
+            ${EXTRA_DIR:+--bottle-dir} ${EXTRA_DIR:+"$EXTRA_DIR"} $dry
+    then :; else
+      failed=$((failed + 1)); warn "failed: $f"
+    fi
+  done
+  [ "$n" -gt 0 ] || die "no profiles found in $d"
+  printf '%d profile(s), %d failed\n' "$n" "$failed"
+  [ "$failed" -eq 0 ] || exit 1
+  exit 0
 fi
 
-cat > "$bundle/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>CFBundleName</key><string>$name</string>
-  <key>CFBundleDisplayName</key><string>$name</string>
-  <key>CFBundleExecutable</key><string>launch</string>
-  <key>CFBundleIdentifier</key><string>local.nvk.$slug</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.2</string>
-  <key>NSHighResolutionCapable</key><true/>
-$icon_line
-</dict></plist>
-PLIST
+# ------------------------------------------------------------- resolution ---
 
-cat > "$bundle/Contents/MacOS/launch" <<LAUNCH
+[ -n "$PROFILE" ] && load_profile "$PROFILE"
+
+bottle=${f_bottle:-$p_bottle}
+app=${f_app:-$p_app}
+needs_steam=${f_needs:-${p_needs:-no}}
+steam_app=${f_steamapp:-$p_steamapp}
+icon_from=${f_icon:-$p_icon}
+dxvk_config=${f_dxvk:-$p_dxvk}
+
+[ -n "$bottle" ] || die "--bottle is required (or a profile that sets it)"
+[ -n "$app" ]    || die "--app is required (or a profile that sets it)"
+[ -n "$steam_app" ] || steam_app='C:\Program Files (x86)\Steam\steam.exe'
+case $needs_steam in yes|no) ;; *) die "needs_steam must be yes or no" ;; esac
+
+# A name, in order: --name, the profile's app_name, "<game> (NVK)", the exe.
+name=${f_name:-$p_name}
+if [ -z "$name" ]; then
+  if [ -n "$p_gamename" ]; then name="$p_gamename (NVK)"
+  else name=$(printf '%s' "$app" | sed 's/.*\\//; s/\.[Ee][Xx][Ee]$//'); fi
+fi
+
+# Arguments become a list of individually quoted tokens, so the launcher can
+# restore them exactly instead of re-splitting a string at run time.
+if [ "$f_args_given" = yes ]; then
+  args_q=$f_arglist
+  args_plain=$f_args
+  if [ -n "$f_args" ]; then
+    for a in $f_args; do args_q="$args_q $(shq "$a")"; done
+  fi
+  # Arguments given one at a time still have to reach the profile, or
+  # --regenerate-all would rebuild this launcher without them.
+  for a in $f_arglist_plain; do
+    args_plain="${args_plain:+$args_plain }$a"
+  done
+else
+  args_q=
+  for a in $p_args; do args_q="$args_q $(shq "$a")"; done
+  args_plain=$p_args
+fi
+args_q=${args_q# }
+
+[ -x "$RUNTIME/bin/nvk-runtime" ] || die "NVK runtime missing: $RUNTIME (pass --runtime)"
+CX_ROOT="$CX_APP/Contents/SharedSupport/CrossOver"
+[ -x "$CX_ROOT/bin/wine" ] || die "CrossOver missing: $CX_APP (pass --crossover)"
+RUNTIME=$(abspath "$RUNTIME")
+CX_ROOT=$(abspath "$CX_ROOT")
+
+# Forwarded as two real arguments, never as a string holding a flag: this
+# domain is full of paths with spaces in it -- CrossOver's own default bottle
+# directory has one -- and an unquoted expansion would split them.
+if [ -n "$EXTRA_DIR" ]; then prefix=$("$HERE/nvk-bottle" --bottle-dir "$EXTRA_DIR" path "$bottle" 2>/dev/null)
+else prefix=$("$HERE/nvk-bottle" path "$bottle" 2>/dev/null); fi
+[ -n "$prefix" ] || die "bottle '$bottle' not found"
+bottle_dir=$(dirname "$prefix")
+
+slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//')
+[ -n "$slug" ] || slug=game
+
+# ------------------------------------------------------- the launcher ------
+# Written to a variable first so --dry-run can show exactly what would run.
+
+launcher=$(cat <<LAUNCH
 #!/bin/sh
-# Generated by nvk-mkapp.sh
-RUNTIME='$RUNTIME'
-CX_ROOT='$CX_ROOT'
-PREFIX='$prefix'
-BOTTLE='$bottle'
-APP='$app'
-ARGS='$args'
-NEEDS_STEAM='$needs_steam'
-STEAM_APP='$steam_app'
+# Generated by nvk-mkapp. Do not edit: regenerate from the profile instead.
+#   nvk-mkapp --profile <profile>     rebuilds this
+# Every value below was quoted at generation time.
+
+RUNTIME=$(shq "$RUNTIME")
+CX_ROOT=$(shq "$CX_ROOT")
+PREFIX=$(shq "$prefix")
+BOTTLE=$(shq "$bottle")
+APP=$(shq "$app")
+NEEDS_STEAM=$(shq "$needs_steam")
+STEAM_APP=$(shq "$steam_app")
+DXVK_CONFIG_VALUE=$(shq "$dxvk_config")
+TITLE=$(shq "$name")
 LOG="\$HOME/Library/Logs/nvk-$slug.log"
+
+# Arguments, restored exactly as they were given rather than re-split.
+eval "set -- $args_q"
 
 # launchd gives GUI apps a minimal environment; set a usable PATH ourselves.
 PATH="\$CX_ROOT/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -102,59 +285,148 @@ PATH="\$CX_ROOT/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 CX_BOTTLE_PATH=\$(/usr/bin/dirname "\$PREFIX")
 export PATH CX_ROOT CX_BOTTLE_PATH
 export WINEMSYNC=1
+[ -n "\$DXVK_CONFIG_VALUE" ] && export DXVK_CONFIG="\$DXVK_CONFIG_VALUE"
 
 mkdir -p "\$HOME/Library/Logs" "\$PREFIX/drive_c/dxvk"
 : > "\$LOG"
 exec >>"\$LOG" 2>&1
-echo "=== \$(date) : $name ==="
-printf 'prefix=%s\\n' "\$PREFIX"
-printf 'app=%s %s\\n' "\$APP" "\$ARGS"
-printf 'CX_BOTTLE_PATH=%s\\n' "\$CX_BOTTLE_PATH"
+printf '=== %s : %s ===\n' "\$(date)" "\$TITLE"
+printf 'prefix=%s\n' "\$PREFIX"
+printf 'app=%s\n' "\$APP"
+printf 'args=%s\n' "\$*"
+printf 'CX_BOTTLE_PATH=%s\n' "\$CX_BOTTLE_PATH"
+
+# AppleScript has its own string syntax; escape before interpolating into it.
+osa_escape() { printf '%s' "\$1" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g'; }
 
 fail() {
-  echo "FAILED: \$1"
-  /usr/bin/osascript -e "display dialog \"\$1\n\nLog: \$LOG\" with title \"$name\" buttons {\"OK\"} default button 1 with icon stop" >/dev/null 2>&1
+  printf 'FAILED: %s\n' "\$1"
+  _m=\$(osa_escape "\$1
+Log: \$LOG")
+  _t=\$(osa_escape "\$TITLE")
+  /usr/bin/osascript -e "display dialog \"\$_m\" with title \"\$_t\" buttons {\"OK\"} default button 1 with icon stop" >/dev/null 2>&1
   exit 1
 }
 
 CXW="\$CX_ROOT/bin/wine"
-[ -x "\$CXW" ] || fail "CrossOver's wine not found at \$CXW"
+[ -x "\$CXW" ] || fail "CrossOver's wine is not at \$CXW. Was CrossOver moved or removed?"
+[ -d "\$PREFIX" ] || fail "The bottle is gone: \$PREFIX"
+[ -d "\$RUNTIME/lib" ] || fail "The NVK runtime is not at \$RUNTIME. Was the driver updated or removed?"
 
-cd "\$PREFIX/drive_c" || fail "cannot cd to \$PREFIX/drive_c"
+cd "\$PREFIX/drive_c" || fail "cannot enter \$PREFIX/drive_c"
 
-steam_up() { /usr/bin/pgrep -f 'steamwebhelper' >/dev/null 2>&1; }
+# Is Steam up *for this bottle*? A global process check lies when Steam is
+# running in a different bottle, so require a wineserver for this prefix too.
+wineserver_here() {
+  _di=\$(/usr/bin/stat -f '%d %i' "\$PREFIX" 2>/dev/null) || return 1
+  _lk="/tmp/.wine-\$(/usr/bin/id -u)/server-\$(printf '%x' "\${_di% *}")-\$(printf '%x' "\${_di#* }")/lock"
+  [ -f "\$_lk" ] || return 1
+  [ -n "\$(/usr/sbin/lsof -t "\$_lk" 2>/dev/null)" ]
+}
+steam_up() { wineserver_here && /usr/bin/pgrep -f steamwebhelper >/dev/null 2>&1; }
 
 if [ "\$NEEDS_STEAM" = yes ]; then
   if steam_up; then
-    echo "Steam already running."
+    echo "Steam already running in this bottle."
   else
     echo "starting Steam..."
-    env WINEPREFIX="\$PREFIX" DYLD_LIBRARY_PATH="\$RUNTIME/lib" DXVK_LOG_PATH='C:\\dxvk' \\
+    env WINEPREFIX="\$PREFIX" DYLD_LIBRARY_PATH="\$RUNTIME/lib" DXVK_LOG_PATH='C:\dxvk' \\
         "\$CXW" --bottle "\$BOTTLE" --cx-app "\$STEAM_APP" &
     n=0
     while [ \$n -lt 120 ]; do
       steam_up && break
-      sleep 1; n=\$((n+1))
+      sleep 1; n=\$((n + 1))
     done
-    steam_up || fail "Steam did not finish starting within 120s. See the log for what wine printed."
+    steam_up || fail "Steam did not finish starting within 120 seconds. The log has what wine printed."
     echo "Steam up after \${n}s; settling..."
     sleep 8
   fi
 fi
 
-echo "launching game..."
-# NOTE: no 'exec' here - nvk_env used to be a shell function and exec cannot
-# replace the shell with a function. Call it plainly and check the status.
-# shellcheck disable=SC2086
-env WINEPREFIX="\$PREFIX" DYLD_LIBRARY_PATH="\$RUNTIME/lib" DXVK_LOG_PATH='C:\\dxvk' \\
-    "\$CXW" --bottle "\$BOTTLE" --cx-app "\$APP" \$ARGS
+echo "launching..."
+env WINEPREFIX="\$PREFIX" DYLD_LIBRARY_PATH="\$RUNTIME/lib" DXVK_LOG_PATH='C:\dxvk' \\
+    "\$CXW" --bottle "\$BOTTLE" --cx-app "\$APP" "\$@"
 rc=\$?
-echo "game exited rc=\$rc"
+echo "exited rc=\$rc"
 [ \$rc -eq 0 ] || fail "The game exited with status \$rc."
 LAUNCH
+)
 
+if [ "$DRY_RUN" = yes ]; then
+  printf '%s\n' "$launcher"
+  exit 0
+fi
+
+# ------------------------------------------------------------- the bundle ---
+
+# The display name may contain anything; the filename may not. A slash would
+# silently create nested directories instead of one bundle, and a leading dot
+# or dash makes a file that is hidden or looks like a flag.
+file_name=$(printf '%s' "$name" | tr '/:' '--' | sed 's/^[.-]*//')
+[ -n "$file_name" ] || file_name=$slug
+bundle="$OUTDIR/$file_name.app"
+mkdir -p "$OUTDIR" || die "cannot create $OUTDIR"
+rm -rf "$bundle"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources" || die "cannot create $bundle"
+
+icon_line=
+if [ -n "$icon_from" ]; then
+  src=$(find "$icon_from" -name '*.icns' 2>/dev/null | head -1)
+  if [ -n "$src" ]; then
+    cp "$src" "$bundle/Contents/Resources/app.icns" && \
+      icon_line='  <key>CFBundleIconFile</key><string>app</string>'
+    printf 'icon:    %s\n' "$src"
+  else
+    warn "no .icns under $icon_from; using the default icon"
+  fi
+fi
+
+bundle_id=$(printf '%s' "$slug" | tr -cd 'a-z0-9-')
+[ -n "$bundle_id" ] || bundle_id=game
+
+{
+  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+  printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+  printf '%s\n' '<plist version="1.0"><dict>'
+  printf '  <key>CFBundleName</key><string>%s</string>\n' "$(xmlesc "$name")"
+  printf '  <key>CFBundleDisplayName</key><string>%s</string>\n' "$(xmlesc "$name")"
+  printf '%s\n' '  <key>CFBundleExecutable</key><string>launch</string>'
+  printf '  <key>CFBundleIdentifier</key><string>local.nvk.%s</string>\n' "$(xmlesc "$bundle_id")"
+  printf '%s\n' '  <key>CFBundlePackageType</key><string>APPL</string>'
+  printf '%s\n' '  <key>CFBundleShortVersionString</key><string>2.0</string>'
+  printf '%s\n' '  <key>NSHighResolutionCapable</key><true/>'
+  [ -n "$icon_line" ] && printf '%s\n' "$icon_line"
+  printf '%s\n' '</dict></plist>'
+} > "$bundle/Contents/Info.plist" || die "cannot write Info.plist"
+
+printf '%s\n' "$launcher" > "$bundle/Contents/MacOS/launch" || die "cannot write the launcher"
 chmod +x "$bundle/Contents/MacOS/launch"
 touch "$bundle"
 
-echo "created: $bundle"
-echo "log:     ~/Library/Logs/nvk-$slug.log"
+if ! plutil -lint "$bundle/Contents/Info.plist" >/dev/null 2>&1; then
+  warn "the generated Info.plist did not lint; the name may contain something unexpected"
+fi
+if ! sh -n "$bundle/Contents/MacOS/launch"; then
+  die "the generated launcher is not valid shell -- this is a bug, please report it with the game's name"
+fi
+
+# ----------------------------------------------------------- save profile ---
+
+if [ -n "$SAVE_PROFILE" ]; then
+  set -- schema=1 "bottle=$bottle" "bottle_dir=$bottle_dir" "exe_win=$app" \
+         "args=$args_plain" "needs_steam=$needs_steam" "app_name=$name"
+  [ -n "$p_appid" ]      && set -- "$@" "appid=$p_appid"
+  [ -n "$p_gamename" ]   && set -- "$@" "name=$p_gamename"
+  [ -n "$p_installdir" ] && set -- "$@" "installdir=$p_installdir"
+  [ -n "$p_exeunix" ]    && set -- "$@" "exe_unix=$p_exeunix"
+  [ -n "$p_anticheat" ]  && set -- "$@" "anticheat=$p_anticheat"
+  [ -n "$p_notes" ]      && set -- "$@" "notes=$p_notes"
+  [ -n "$dxvk_config" ]  && set -- "$@" "dxvk_config=$dxvk_config"
+  [ -n "$steam_app" ]    && set -- "$@" "steam_app=$steam_app"
+  [ -n "$icon_from" ]    && set -- "$@" "icon_from=$icon_from"
+  "$HERE/nvk-profile" write "$SAVE_PROFILE" "$@" >/dev/null || die "could not write $SAVE_PROFILE"
+  printf 'profile: %s\n' "$SAVE_PROFILE"
+fi
+
+printf 'created: %s\n' "$bundle"
+printf 'log:     ~/Library/Logs/nvk-%s.log\n' "$slug"

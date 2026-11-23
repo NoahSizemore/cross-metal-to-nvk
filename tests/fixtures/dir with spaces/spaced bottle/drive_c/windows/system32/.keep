@@ -1,0 +1,2 @@
+Git does not track empty directories, and a dosdevices symlink that
+points at a missing drive_c would dangle in a fresh clone.

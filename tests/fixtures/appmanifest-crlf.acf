@@ -1,0 +1,13 @@
+"AppState"
+{
+	"appid"		"555000"
+	"name"		"CRLF Game"
+	"installdir"		"CRLF Dir"
+	"InstalledDepots"
+	{
+		"1"
+		{
+			"name"		"nested"
+		}
+	}
+}

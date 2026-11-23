@@ -1,52 +1,580 @@
 #!/bin/sh
-# Report the current graphics configuration of the NVK/CrossOver setup.
-# Read-only -- changes nothing. Run any time: sh ~/Downloads/nvk-status.sh
+# nvk-doctor -- preflight gate and bug-report artifact for cross-metal-to-nvk.
+#
+#   nvk-doctor [options] [--bottle NAME]...
+#
+# Read-only. It changes nothing, anywhere, and never needs sudo. Run it before
+# anything else, and paste its entire output into a bug report.
+#
+# Options
+#   --bottle NAME      also check this bottle (repeatable)
+#   --all-bottles      check every bottle found
+#   --driver PATH      driver bundle root  (default /Library/GPUBundles/nvmtl)
+#   --runtime PATH     Wine/NVK runtime    (default <driver>/wine)
+#   --crossover PATH   CrossOver.app       (default /Applications/CrossOver.app)
+#   --bottle-dir PATH  look for bottles here too
+#   --no-vulkan        skip the Vulkan ICD probe (it dlopens the loader)
+#   --no-checksums     skip full runtime checksum verification (faster)
+#   --quiet            print only problems and the summary
+#   --color WHEN       auto (default) | always | never
+#   --version          print the version of this tool and exit
+#   -h, --help         this text
+#
+# Exit status is the gate:
+#   0   everything required is present and correct
+#   2   usable, but at least one check wants attention
+#   1   at least one fatal problem -- do not continue
+#
+# Nothing about this machine is baked in. Paths come from flags, from
+# CrossOver's own preferences, and from the runtime's SHA256SUMS; versions are
+# read and reported rather than asserted.
 
-P=/Volumes/Storage/CrossOver/Bottles/Steam
-R=/Library/GPUBundles/nvmtl/wine
-UD="$P/drive_c/Program Files (x86)/Steam/userdata/892063861/1422450"
-G="$P/drive_c/Program Files (x86)/Steam/steamapps/common/Deadlock"
+NVK_DOCTOR_VERSION=0.2.0
 
-echo "=============== cxbottle.conf [EnvironmentVariables] ==============="
-sed -n '/\[EnvironmentVariables\]/,$p' "$P/cxbottle.conf"
-echo
-echo "CX_GRAPHICS_BACKEND present? (want: no output = unset)"
-grep -c CX_GRAPHICS_BACKEND "$P/cxbottle.conf" | sed 's/^0$/  none - unset (OK)/'
+# ---------------------------------------------------------------- options ---
 
-echo
-echo "=============== registry DLL overrides ==============="
-grep -nE '"(d3d11|dxgi|d3d12|vulkan-1)"' "$P/user.reg" || echo "  (no d3d11/dxgi entries found)"
+DRIVER=/Library/GPUBundles/nvmtl
+RUNTIME=
+CX_APP=/Applications/CrossOver.app
+EXTRA_DIR=
+WANT_BOTTLES=
+ALL_BOTTLES=no
+DO_VULKAN=yes
+DO_SUMS=yes
+QUIET=no
+COLOR=auto
 
-echo
-echo "=============== DXVK pair in system32 ==============="
-for f in d3d11 dxgi; do
-  h=$(shasum -a 256 "$P/drive_c/windows/system32/$f.dll" 2>/dev/null | cut -d' ' -f1)
-  case "$f:$h" in
-    d3d11:a9a01503d658adf9fad93f1768ff06bc2688acb855ef0e7e0153e761f90ea5f0)
-      echo "  d3d11.dll  OK  (runtime's repaired DXVK 3.1.1)" ;;
-    dxgi:cd0d57cb5ae8e29440cfabc185fe2446f24c1acca2ff238b4e994e69e7c913d4)
-      echo "  dxgi.dll   OK  (runtime's repaired DXVK 3.1.1)" ;;
-    *) echo "  $f.dll  MISMATCH -> $h"
-       echo "     re-run: $R/bin/nvk-runtime install $R $P" ;;
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
+die()   { printf 'nvk-doctor: %s\n' "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --bottle)      [ $# -ge 2 ] || die "--bottle needs a name"
+                   WANT_BOTTLES="${WANT_BOTTLES}${2}
+"; shift 2 ;;
+    --bottle=*)    WANT_BOTTLES="${WANT_BOTTLES}${1#*=}
+"; shift ;;
+    --all-bottles) ALL_BOTTLES=yes; shift ;;
+    --driver)      [ $# -ge 2 ] || die "--driver needs a path"; DRIVER=$2; shift 2 ;;
+    --driver=*)    DRIVER=${1#*=}; shift ;;
+    --runtime)     [ $# -ge 2 ] || die "--runtime needs a path"; RUNTIME=$2; shift 2 ;;
+    --runtime=*)   RUNTIME=${1#*=}; shift ;;
+    --crossover)   [ $# -ge 2 ] || die "--crossover needs a path"; CX_APP=$2; shift 2 ;;
+    --crossover=*) CX_APP=${1#*=}; shift ;;
+    --bottle-dir)  [ $# -ge 2 ] || die "--bottle-dir needs a path"; EXTRA_DIR=$2; shift 2 ;;
+    --bottle-dir=*) EXTRA_DIR=${1#*=}; shift ;;
+    --no-vulkan)   DO_VULKAN=no; shift ;;
+    --no-checksums) DO_SUMS=no; shift ;;
+    --quiet|-q)    QUIET=yes; shift ;;
+    --color)       [ $# -ge 2 ] || die "--color needs a value"; COLOR=$2; shift 2 ;;
+    --color=*)     COLOR=${1#*=}; shift ;;
+    --version)     printf 'nvk-doctor %s\n' "$NVK_DOCTOR_VERSION"; exit 0 ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; break ;;
+    -*)            die "unknown option: $1 (try --help)" ;;
+    *)             die "unexpected argument: $1 (bottles go after --bottle)" ;;
   esac
 done
 
-echo
-echo "=============== launch args in the script ==============="
-grep -n "^game_args=" "$HOME/Downloads/deadlock-nvk.sh" 2>/dev/null || echo "  script not at ~/Downloads/deadlock-nvk.sh"
+[ -n "$RUNTIME" ] || RUNTIME="$DRIVER/wine"
 
-echo
-echo "=============== video.txt ==============="
-if [ -f "$UD/local/cfg/video.txt" ]; then
-  grep -E 'VendorID|DeviceID|upscaling|viewportscale|knowndevice' "$UD/local/cfg/video.txt" \
-    || echo "  (present, none of the interesting keys)"
+case $COLOR in
+  always) use_color=yes ;;
+  never)  use_color=no ;;
+  auto)   if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then use_color=yes; else use_color=no; fi ;;
+  *)      die "--color takes auto, always or never" ;;
+esac
+
+if [ "$use_color" = yes ]; then
+  C_OK=$(printf '\033[32m');   C_WARN=$(printf '\033[33m')
+  C_BAD=$(printf '\033[31m');  C_DIM=$(printf '\033[2m')
+  C_HEAD=$(printf '\033[1m');  C_OFF=$(printf '\033[0m')
 else
-  echo "  absent - engine will profile fresh on next successful device creation (OK)"
+  C_OK=; C_WARN=; C_BAD=; C_DIM=; C_HEAD=; C_OFF=
 fi
 
-echo
-echo "=============== logs that would prove DXVK ran ==============="
-find "$P" -name '*d3d11.log' -o -name '*dxvk*.log' 2>/dev/null | head -5
-ls "$P/drive_c/dxvk/" 2>/dev/null | head -5
-echo "  console.log:"
-ls -l "$G/game/citadel/console.log" 2>/dev/null || echo "    none yet"
+# ---------------------------------------------------------------- output ----
+
+N_OK=0; N_WARN=0; N_BAD=0
+
+# Section headers are deferred so that --quiet, which prints nothing for a
+# clean section, does not leave an empty heading behind.
+PENDING_SEC=
+flush_sec() {
+  [ -n "$PENDING_SEC" ] || return 0
+  printf '\n%s== %s ==%s\n' "$C_HEAD" "$PENDING_SEC" "$C_OFF"
+  PENDING_SEC=
+}
+sec()  { PENDING_SEC=$1; [ "$QUIET" = yes ] || flush_sec; }
+line() { flush_sec; printf '  %s %-26s %s\n' "$1" "$2" "$3"; }
+hint() { [ -n "$1" ] && printf '       %s%s%s\n' "$C_DIM" "$1" "$C_OFF"; }
+
+ok()   { N_OK=$((N_OK + 1));   [ "$QUIET" = yes ] || line "${C_OK}[ ok ]${C_OFF}" "$1" "$2"; }
+inf()  {                       [ "$QUIET" = yes ] || line "${C_DIM}[info]${C_OFF}" "$1" "$2"; }
+wrn()  { N_WARN=$((N_WARN + 1)); line "${C_WARN}[warn]${C_OFF}" "$1" "$2"; hint "${3:-}"; }
+bad()  { N_BAD=$((N_BAD + 1));   line "${C_BAD}[FAIL]${C_OFF}" "$1" "$2"; hint "${3:-}"; }
+
+# --------------------------------------------------------------- helpers ----
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SUMS="$RUNTIME/SHA256SUMS"
+
+# Expected hash for one path as SHA256SUMS spells it, e.g. ./dxvk/x64/d3d11.dll
+sums_lookup() {
+  [ -f "$SUMS" ] || return 1
+  awk -v k="$1" '$2 == k { print $1; hit = 1; exit } END { exit !hit }' "$SUMS"
+}
+
+file_sha() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# Read one "key" : "value" string out of a flat JSON blob on stdin.
+json_str() { sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1; }
+
+# Bottle discovery lives in nvk-bottle and nowhere else: two implementations
+# of this lookup would eventually disagree about where a bottle is, and the
+# disagreement would show up as a launcher that points at the wrong prefix.
+NVK_BOTTLE="$HERE/nvk-bottle"
+# Forwarded as two real arguments, never as a string holding a flag: this
+# domain is full of paths with spaces in it -- CrossOver's own default bottle
+# directory has one -- and an unquoted expansion would split them.
+nvk_bottle() {
+  [ -x "$NVK_BOTTLE" ] || return 1
+  if [ -n "$EXTRA_DIR" ]; then "$NVK_BOTTLE" --bottle-dir "$EXTRA_DIR" "$@"
+  else "$NVK_BOTTLE" "$@"; fi
+}
+bottle_dirs() { nvk_bottle dirs 2>/dev/null; }
+find_bottle()  { nvk_bottle path "$1" 2>/dev/null; }
+
+# ---------------------------------------------------------------- header ----
+
+printf '%snvk-doctor %s%s  %s\n' "$C_HEAD" "$NVK_DOCTOR_VERSION" "$C_OFF" "$(date '+%Y-%m-%d %H:%M:%S %z')"
+printf '%sPaste this whole report into a bug report.%s\n' "$C_DIM" "$C_OFF"
+
+# ------------------------------------------------------------------- host ---
+
+sec "Host"
+
+arch=$(uname -m)
+is_arm=no
+[ "$arch" = arm64 ] && is_arm=yes
+[ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ] && is_arm=yes
+
+if [ "$is_arm" = yes ]; then
+  bad "architecture" "$arch (Apple Silicon)" \
+      "This path needs a real NVIDIA GPU on an Intel Mac. Use D3DMetal / Game Porting Toolkit instead."
+elif [ "$arch" = x86_64 ]; then
+  ok "architecture" "$arch"
+else
+  wrn "architecture" "$arch" "Unrecognised; expected x86_64."
+fi
+
+inf "cpu" "$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+
+os_ver=$(sw_vers -productVersion 2>/dev/null)
+os_major=${os_ver%%.*}
+if [ -z "$os_ver" ]; then
+  wrn "macOS" "unknown" "sw_vers produced nothing."
+elif [ "${os_major:-0}" -ge 15 ] 2>/dev/null; then
+  ok "macOS" "$os_ver ($(sw_vers -buildVersion 2>/dev/null))"
+else
+  wrn "macOS" "$os_ver" "The runtime is built against the macOS 15 SDK; older systems are untested."
+fi
+
+if [ "$(id -u)" = 0 ]; then
+  wrn "privileges" "running as root" \
+      "Do not run this under sudo: the Vulkan loader ignores VK_DRIVER_FILES for elevated processes."
+else
+  ok "privileges" "unprivileged (correct)"
+fi
+
+# -------------------------------------------------------------------- gpu ---
+
+sec "GPU"
+
+gpus=$(system_profiler SPDisplaysDataType 2>/dev/null | awk '
+  function val(s) { sub(/^[ \t]*[^:]*:[ \t]*/, "", s); return s }
+  function emit() { if (name != "") printf "%s|%s|%s\n", name, vend, dev }
+  /Chipset Model:/ { emit(); name = val($0); vend = ""; dev = "" }
+  /Vendor:/        { if (match($0, /0x[0-9a-fA-F]+/)) vend = substr($0, RSTART, RLENGTH) }
+  /Device ID:/     { if (match($0, /0x[0-9a-fA-F]+/)) dev  = substr($0, RSTART, RLENGTH) }
+  END              { emit() }')
+
+nvidia_ok=no
+if [ -z "$gpus" ]; then
+  bad "detection" "no GPU reported" "system_profiler SPDisplaysDataType returned nothing."
+else
+  oIFS=$IFS; IFS='
+'
+  for g in $gpus; do
+    IFS=$oIFS
+    gname=${g%%|*}; grest=${g#*|}; gvend=${grest%%|*}; gdev=${grest##*|}
+    if [ "$gvend" != 0x10de ]; then
+      inf "other GPU" "$gname (vendor ${gvend:-?})"
+    elif [ -z "$gdev" ]; then
+      wrn "NVIDIA GPU" "$gname (no device ID)" "Cannot tell whether this is Turing or newer."
+      nvidia_ok=yes
+    elif [ "$((gdev))" -ge "$((0x1e00))" ]; then
+      ok "NVIDIA GPU" "$gname ($gdev)"
+      nvidia_ok=yes
+    else
+      bad "NVIDIA GPU" "$gname ($gdev)" \
+          "NVK requires Turing (RTX 20 / GTX 16) or newer. This device ID predates it."
+    fi
+    IFS='
+'
+  done
+  IFS=$oIFS
+fi
+
+[ "$nvidia_ok" = no ] && [ -n "$gpus" ] && \
+  bad "NVIDIA GPU" "none usable" "No Turing-or-newer NVIDIA GPU was found."
+
+# ----------------------------------------------------------------- driver ---
+
+sec "Driver bundle"
+
+inf "root" "$DRIVER"
+if [ ! -d "$DRIVER" ]; then
+  bad "driver bundle" "missing" "Install the NullMoth driver (3.0 or newer), including its Wine runtime."
+else
+  ok "driver bundle" "present"
+
+  loader="$DRIVER/libvulkan.1.dylib"
+  if [ -e "$loader" ]; then
+    target=$(readlink "$loader" 2>/dev/null)
+    ok "Vulkan loader" "${target:-$(basename "$loader")}"
+  else
+    bad "Vulkan loader" "missing at $loader"
+  fi
+
+  icd="$DRIVER/nvk_icd.json"
+  if [ -f "$icd" ]; then
+    icd_lib=$(json_str library_path < "$icd")
+    icd_api=$(json_str api_version < "$icd")
+    case $icd_lib in
+      /*) : ;;
+      *)  icd_lib="$DRIVER/$icd_lib" ;;
+    esac
+    if [ -e "$icd_lib" ]; then
+      ok "ICD manifest" "api $icd_api -> $(basename "$icd_lib")"
+    else
+      bad "ICD manifest" "points at a missing library" "$icd says library_path = $icd_lib"
+    fi
+  else
+    bad "ICD manifest" "missing at $icd"
+  fi
+
+  # The AIR translator writes shader refusals here. Root-owned by default, so
+  # nothing lands unless the directory exists and you own it.
+  fa="$DRIVER/failed-air"
+  if [ ! -d "$fa" ]; then
+    wrn "failed-air" "absent" \
+        "Translator refusals will be lost. sudo mkdir -p '$fa' && sudo chown \"\$(id -un)\":staff '$fa'"
+  elif [ -w "$fa" ]; then
+    ok "failed-air" "writable ($(ls -1 "$fa" 2>/dev/null | wc -l | tr -d ' ') entries)"
+  else
+    wrn "failed-air" "not writable by $(id -un)" \
+        "sudo chown \"\$(id -un)\":staff '$fa'"
+  fi
+fi
+
+# ---------------------------------------------------------------- runtime ---
+
+sec "Wine/NVK runtime"
+
+inf "root" "$RUNTIME"
+if [ ! -d "$RUNTIME" ]; then
+  bad "runtime" "missing" "The driver's Wine runtime is a separate component. Install it, then re-run."
+else
+  ok "runtime" "present"
+
+  if [ -f "$RUNTIME/BUILD.json" ]; then
+    build_id=$(json_str source_runtime_id < "$RUNTIME/BUILD.json")
+    inf "BUILD.json runtime id" "${build_id:-unreadable}"
+  else
+    wrn "BUILD.json" "absent" "Cannot report which runtime build this is."
+  fi
+
+  nvkrt="$RUNTIME/bin/nvk-runtime"
+  if [ ! -x "$nvkrt" ]; then
+    bad "nvk-runtime" "missing at $nvkrt"
+  else
+    chk=$("$nvkrt" check "$RUNTIME" 2>&1); chk_rc=$?
+    chk_result=$(printf '%s' "$chk" | json_str result)
+    chk_id=$(printf '%s' "$chk" | json_str runtime_id)
+    if [ "$chk_rc" -eq 0 ] && [ "$chk_result" = PASS ]; then
+      ok "nvk-runtime check" "PASS (${chk_id:-id unknown})"
+      for feat in d3d12 dlss hud; do
+        case $chk in
+          *"\"supports_$feat\" : true"*) inf "supports $feat" "yes" ;;
+          *"\"supports_$feat\""*)        inf "supports $feat" "no" ;;
+        esac
+      done
+    else
+      bad "nvk-runtime check" "${chk_result:-rc=$chk_rc}" "$(printf '%s' "$chk" | tr -d '\n' | cut -c1-160)"
+    fi
+    # Reported by the binary vs. recorded in the manifest. They are different
+    # fields and need not agree; report both rather than judge.
+    if [ -n "${build_id:-}" ] && [ -n "$chk_id" ] && [ "$build_id" != "$chk_id" ]; then
+      inf "runtime id" "binary $chk_id / manifest $build_id"
+    fi
+  fi
+
+  if [ ! -f "$SUMS" ]; then
+    wrn "SHA256SUMS" "absent" "Cannot verify runtime files, and bottle DLLs cannot be checked."
+  elif [ "$DO_SUMS" = no ]; then
+    inf "SHA256SUMS" "present (verification skipped)"
+  else
+    sums_out=$(cd "$RUNTIME" && shasum -a 256 -c SHA256SUMS 2>&1)
+    sums_rc=$?
+    n_files=$(printf '%s\n' "$sums_out" | grep -c ': OK$')
+    if [ "$sums_rc" -eq 0 ]; then
+      ok "runtime integrity" "$n_files files match SHA256SUMS"
+    else
+      bad "runtime integrity" "$(printf '%s\n' "$sums_out" | grep -v ': OK$' | head -3 | tr '\n' ' ')" \
+          "Re-install the runtime; these files do not match its own manifest."
+    fi
+  fi
+fi
+
+# ----------------------------------------------------------------- vulkan ---
+
+sec "Vulkan"
+
+PROBE="$HERE/vk-icd-probe.py"
+if [ "$DO_VULKAN" = no ]; then
+  inf "ICD probe" "skipped (--no-vulkan)"
+elif [ ! -f "$PROBE" ]; then
+  wrn "ICD probe" "vk-icd-probe.py not found beside this script" "Expected at $PROBE"
+elif ! command -v python3 >/dev/null 2>&1; then
+  wrn "ICD probe" "python3 not found" "Install the Command Line Tools, or re-run with --no-vulkan."
+else
+  probe=$(VK_DRIVER_FILES="$DRIVER/nvk_icd.json" VK_LOADER_LIB="$DRIVER/libvulkan.1.dylib" \
+          python3 "$PROBE" 2>&1)
+  probe_rc=$?
+  if [ "$probe_rc" -ne 0 ]; then
+    bad "ICD probe" "failed (rc=$probe_rc)" "$(printf '%s\n' "$probe" | grep -i '^FAIL' | head -1)"
+    [ "$QUIET" = yes ] || printf '%s\n' "$probe" | sed 's/^/       /'
+  else
+    dev_line=$(printf '%s\n' "$probe" | grep -m1 '^\[device ')
+    api=$(printf '%s\n' "$probe" | sed -n 's/.*apiVersion *: *//p' | head -1)
+    if printf '%s\n' "$probe" | grep -q '<- NVIDIA'; then
+      ok "native NVK" "${dev_line#*] } (Vulkan ${api:-?})"
+    else
+      bad "native NVK" "enumerated, but no NVIDIA vendor ID" \
+          "The loader found an ICD that is not NVK. Check VK_DRIVER_FILES and $DRIVER/nvk_icd.json."
+      [ "$QUIET" = yes ] || printf '%s\n' "$probe" | sed 's/^/       /'
+    fi
+  fi
+fi
+
+# -------------------------------------------------------------- crossover ---
+
+sec "CrossOver"
+
+if [ ! -d "$CX_APP" ]; then
+  bad "CrossOver" "not found at $CX_APP" "Pass --crossover PATH if it lives elsewhere."
+else
+  cxver=$(defaults read "$CX_APP/Contents/Info" CFBundleShortVersionString 2>/dev/null)
+  ok "CrossOver" "${cxver:-version unreadable} ($CX_APP)"
+  [ -x "$CX_APP/Contents/SharedSupport/CrossOver/bin/wine" ] \
+    || bad "wine binary" "missing inside the app bundle"
+fi
+
+if [ ! -x "$NVK_BOTTLE" ]; then
+  bad "nvk-bottle" "not found beside this script" \
+      "The tools expect to live in the same directory; expected $NVK_BOTTLE"
+fi
+BOTTLE_DIRS=$(bottle_dirs)
+if [ -z "$BOTTLE_DIRS" ]; then
+  if [ -x "$NVK_BOTTLE" ]; then
+    bad "bottle directories" "none found" \
+        "Checked CX_BOTTLE_PATH, CrossOver's BottleDir preference, and the default location."
+  else
+    bad "bottle directories" "could not look" \
+        "nvk-bottle is missing, and it is what performs this lookup."
+  fi
+else
+  oIFS=$IFS; IFS='
+'
+  for d in $BOTTLE_DIRS; do
+    IFS=$oIFS
+    n=$(find "$d" -maxdepth 2 -name cxbottle.conf 2>/dev/null | wc -l | tr -d ' ')
+    ok "bottle directory" "$d ($n bottles)"
+    IFS='
+'
+  done
+  IFS=$oIFS
+fi
+
+if pgrep -x wineserver >/dev/null 2>&1; then
+  wrn "wineserver" "running" \
+      "Bottle setup rewrites cxbottle.conf and needs it stopped: 'Quit All Applications' on the bottle first."
+else
+  ok "wineserver" "not running"
+fi
+
+# ---------------------------------------------------------------- bottles ---
+
+if [ "$ALL_BOTTLES" = yes ]; then
+  oIFS=$IFS; IFS='
+'
+  for d in $BOTTLE_DIRS; do
+    IFS=$oIFS
+    for c in "$d"/*/cxbottle.conf; do
+      [ -f "$c" ] || continue
+      b=$(basename "$(dirname "$c")")
+      WANT_BOTTLES="${WANT_BOTTLES}${b}
+"
+    done
+    IFS='
+'
+  done
+  IFS=$oIFS
+fi
+
+check_bottle() {
+  b=$1
+  sec "Bottle: $b"
+
+  prefix=$(find_bottle "$b")
+  if [ -z "$prefix" ]; then
+    bad "bottle" "'$b' not found" "Looked under: $(printf '%s' "$BOTTLE_DIRS" | tr '\n' ' ')"
+    return
+  fi
+  inf "prefix" "$prefix"
+  conf="$prefix/cxbottle.conf"
+
+  # Does this bottle actually route d3d12 to a native DLL? A bottle that does
+  # not is using CrossOver's own builtin vkd3d, which NVK never sees -- so
+  # comparing that file against the runtime would be reporting on something
+  # that is not in the chain.
+  conf_pre="$prefix/cxbottle.conf"
+  uses_d3d12=no
+  if [ -f "$conf_pre" ] && grep -q '"WINEDLLOVERRIDES".*d3d12' "$conf_pre" 2>/dev/null; then
+    uses_d3d12=yes
+  fi
+
+  # --- the DXVK pair, verified against the runtime's own manifest ----------
+  for pair in "d3d11.dll:./dxvk/x64/d3d11.dll:required" \
+              "dxgi.dll:./dxvk/x64/dxgi.dll:required" \
+              "d3d12.dll:./vkd3d/x64/d3d12.dll:d3d12" \
+              "d3d12core.dll:./vkd3d/x64/d3d12core.dll:d3d12"; do
+    dll=${pair%%:*}; rest=${pair#*:}; key=${rest%%:*}; need=${rest##*:}
+    # A vkd3d DLL only matters when the bottle is configured to use it.
+    [ "$need" = d3d12 ] && [ "$uses_d3d12" = no ] && need=unused
+    p="$prefix/drive_c/windows/system32/$dll"
+    if [ ! -e "$p" ]; then
+      case $need in
+        required) bad "$dll" "absent" "Run: nvk-bottle setup $b" ;;
+        d3d12)    bad "$dll" "absent, but this bottle routes d3d12 to native" \
+                      "Run: nvk-bottle setup $b --d3d12" ;;
+        *)        inf "$dll" "absent (not in use; 'nvk-bottle setup $b --d3d12' adds it)" ;;
+      esac
+      continue
+    fi
+    want=$(sums_lookup "$key")
+    if [ -z "$want" ]; then
+      inf "$dll" "present ($(file_sha "$p" | cut -c1-16)), no manifest entry to compare"
+    elif [ "$(file_sha "$p")" = "$want" ]; then
+      ok "$dll" "matches the runtime's manifest"
+    elif [ "$need" = required ]; then
+      bad "$dll" "does not match the runtime" \
+          "Installed $(file_sha "$p" | cut -c1-16), runtime has $(echo "$want" | cut -c1-16). Re-run: nvk-bottle setup $b"
+    elif [ "$need" = d3d12 ]; then
+      bad "$dll" "in use, but does not match the runtime" \
+          "Installed $(file_sha "$p" | cut -c1-16), runtime has $(echo "$want" | cut -c1-16). Re-run: nvk-bottle setup $b --d3d12"
+    else
+      inf "$dll" "present but not in use (CrossOver's own; this bottle does not route d3d12 to native)"
+    fi
+  done
+
+  # --- cxbottle.conf ------------------------------------------------------
+  if [ ! -f "$conf" ]; then
+    bad "cxbottle.conf" "missing"
+    return
+  fi
+
+  if grep -q 'managed by nvk-bottle' "$conf" 2>/dev/null; then
+    ok "managed env block" "present"
+  else
+    bad "managed env block" "absent" "The bottle has not been set up. Run: nvk-bottle setup $b"
+  fi
+
+  if grep -q 'CX_GRAPHICS_BACKEND' "$conf" 2>/dev/null; then
+    wrn "CX_GRAPHICS_BACKEND" "set" \
+        "CrossOver will choose its own D3D path. Re-run nvk-bottle setup to remove it."
+  else
+    ok "CX_GRAPHICS_BACKEND" "unset (correct)"
+  fi
+
+  # Keys set both inside and outside the managed block, or twice outside it.
+  # Which copy wins is not worth reasoning about -- there should be one.
+  dupes=$(awk '
+    /^\[EnvironmentVariables\]/      { env = 1; next }
+    /^\[/                            { env = 0 }
+    !env                             { next }
+    /managed by nvk-bottle/          { blk = !blk; next }
+    match($0, /^[ \t]*"[A-Za-z_][A-Za-z0-9_]*"/) {
+      k = substr($0, RSTART, RLENGTH); gsub(/[" \t]/, "", k)
+      if (blk) inside[k] = 1; else outside[k]++
+    }
+    END { for (k in outside) if (inside[k] || outside[k] > 1) print k }
+  ' "$conf" | sort | tr '\n' ' ')
+  if [ -n "$dupes" ]; then
+    wrn "duplicate env keys" "${dupes% }" \
+        "Defined more than once in [EnvironmentVariables]. Remove the copies outside the managed block."
+  else
+    ok "duplicate env keys" "none"
+  fi
+
+  if grep -q '"DYLD_LIBRARY_PATH"' "$conf" 2>/dev/null; then
+    inf "DYLD_LIBRARY_PATH" "set in the bottle (launching from CrossOver/Steam directly will work)"
+  else
+    inf "DYLD_LIBRARY_PATH" "not set in the bottle (generated .app launchers set it themselves)"
+  fi
+
+  # --- registry overrides -------------------------------------------------
+  reg="$prefix/user.reg"
+  if [ -f "$reg" ]; then
+    missing=
+    for v in d3d11 dxgi; do
+      grep -q "\"$v\"=\"native\"" "$reg" 2>/dev/null || missing="$missing $v"
+    done
+    if [ -z "$missing" ]; then
+      ok "DLL overrides" "d3d11, dxgi = native"
+    else
+      wrn "DLL overrides" "not native for:$missing" "Re-run: nvk-bottle setup $b"
+    fi
+  else
+    wrn "user.reg" "absent" "The bottle may never have been started."
+  fi
+}
+
+oIFS=$IFS; IFS='
+'
+for b in $(printf '%s' "$WANT_BOTTLES" | awk 'NF && !seen[$0]++'); do
+  IFS=$oIFS
+  check_bottle "$b"
+  IFS='
+'
+done
+IFS=$oIFS
+
+# ---------------------------------------------------------------- summary ---
+
+sec "Summary"
+flush_sec
+printf '  %s%d ok%s, %s%d warning(s)%s, %s%d failure(s)%s\n' \
+  "$C_OK" "$N_OK" "$C_OFF" "$C_WARN" "$N_WARN" "$C_OFF" "$C_BAD" "$N_BAD" "$C_OFF"
+
+if [ "$N_BAD" -gt 0 ]; then
+  printf '  %sNot ready. Fix the failures above before going further.%s\n' "$C_BAD" "$C_OFF"
+  exit 1
+elif [ "$N_WARN" -gt 0 ]; then
+  printf '  %sUsable, with caveats noted above.%s\n' "$C_WARN" "$C_OFF"
+  exit 2
+else
+  printf '  %sReady.%s\n' "$C_OK" "$C_OFF"
+  exit 0
+fi

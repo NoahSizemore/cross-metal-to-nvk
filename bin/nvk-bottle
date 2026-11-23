@@ -1,139 +1,372 @@
 #!/bin/sh
-# Native NVK for any CrossOver bottle.
+# nvk-bottle -- point one CrossOver bottle at native NVK.
 #
-#   sh nvk-bottle.sh setup  <bottle> [--d3d12] [--dyld]
-#   sh nvk-bottle.sh run    <bottle> '<path\relative\to\drive_c.exe>' [args...]
-#   sh nvk-bottle.sh status <bottle>
-#   sh nvk-bottle.sh undo   <bottle>
+#   nvk-bottle dirs
+#   nvk-bottle list
+#   nvk-bottle path    <bottle>
+#   nvk-bottle status  <bottle>
+#   nvk-bottle setup   <bottle> [--d3d12] [--dlss] [--dyld] [--no-hud]
+#                               [--dxvk-config TEXT] [--yes]
+#   nvk-bottle run     <bottle> '<path\relative\to\drive_c.exe>' [args...]
+#   nvk-bottle undo    <bottle> [--yes]
 #
-# setup  - installs the runtime's DXVK (and optionally vkd3d) into the prefix and
-#          writes the Wine env block into cxbottle.conf. Run once per bottle.
-#          --dyld also puts DYLD_LIBRARY_PATH in cxbottle.conf, which lets you
-#          launch from CrossOver's GUI / Steam's Play button with no script.
-#          (The runtime README advises against setting it globally; per-bottle is
-#          narrower, but if the bottle misbehaves, re-run setup without --dyld.)
-# run    - launches one app with the environment set explicitly (always works,
-#          even without --dyld).
+# dirs    - every directory CrossOver keeps bottles in, one per line.
+# list    - every bottle found, one name per line.
+# path    - the prefix directory for one bottle.
+# status  - what is installed in a bottle right now.
+# setup   - installs the runtime's DXVK (and optionally vkd3d and DLSS) into the
+#           prefix and writes the Wine environment block into cxbottle.conf.
+#           Run once per bottle. It rewrites a configuration file, so it asks
+#           first unless --yes is given, and it needs the bottle's wineserver
+#           stopped.
+#           --dyld also puts DYLD_LIBRARY_PATH in cxbottle.conf, which lets you
+#           launch from CrossOver's GUI / Steam's Play button with no script.
+#           (The runtime README advises against setting it globally; per-bottle
+#           is narrower, but if the bottle misbehaves, re-run without --dyld.)
+# run     - launches one app with the environment set explicitly. Always works,
+#           even without --dyld.
+# undo    - restores the prefix and the backed-up cxbottle.conf.
+#
+# clean-conf <file> prints a cxbottle.conf with the managed block and every
+# stray definition of a key it owns removed. Read-only, writes to stdout; it is
+# how setup's rewrite is tested against fixtures.
+#
+# Options accepted anywhere:
+#   --runtime PATH     Wine/NVK runtime  (default /Library/GPUBundles/nvmtl/wine)
+#   --crossover PATH   CrossOver.app     (default /Applications/CrossOver.app)
+#   --bottle-dir PATH  look for bottles here too (repeatable)
+#
+# Exit: 0 success, 1 error.
 
-set -eu
+set -u
 
-RUNTIME=/Library/GPUBundles/nvmtl/wine
-CX_ROOT='/Applications/CrossOver.app/Contents/SharedSupport/CrossOver'
-CXW="$CX_ROOT/bin/wine"
+RUNTIME=${NVK_RUNTIME:-/Library/GPUBundles/nvmtl/wine}
+CX_APP=${NVK_CROSSOVER:-/Applications/CrossOver.app}
+EXTRA_DIRS=
+ASSUME_YES=no
 
-# Where your bottles live. Default location is ~/Library/Application Support/...
-BOTTLE_DIRS="/Volumes/Storage/CrossOver/Bottles:$HOME/Library/Application Support/CrossOver/Bottles"
+MARK='# --- native NVK (managed by nvk-bottle) ---'
+MARK_OLD='# --- native NVK (managed by nvk-bottle.sh) ---'
+# Keys the managed block owns. Copies elsewhere in the file are removed on
+# setup, because which one wins is not worth reasoning about.
+OWNED_KEYS='WINEDLLOVERRIDES DXVK_CONFIG DXVK_HUD DXVK_LOG_LEVEL WINEMSYNC DYLD_LIBRARY_PATH CX_GRAPHICS_BACKEND'
 
-MARK='# --- native NVK (managed by nvk-bottle.sh) ---'
+die()  { printf 'nvk-bottle: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'nvk-bottle: %s\n' "$*" >&2; }
+usage() { sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; }
 
-die() { echo "error: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] && die "do not run this as root; nothing here needs sudo"
 
-find_bottle() {
-  _b=$1
-  IFS=:
-  for d in $BOTTLE_DIRS; do
-    [ -d "$d/$_b" ] && { unset IFS; printf '%s' "$d/$_b"; return 0; }
-  done
-  unset IFS
-  die "bottle '$_b' not found under: $BOTTLE_DIRS"
+cx_wine() { printf '%s' "$CX_APP/Contents/SharedSupport/CrossOver/bin/wine"; }
+
+# CrossOver's --bottle searches only its two built-in locations; it does NOT
+# consult the BottleDir preference. A bottle on another volume is therefore
+# invisible to it unless CX_BOTTLE_PATH says where to look. Every invocation
+# of CrossOver's wine has to go through here.
+cx_run() { # $1 = prefix, rest: wine arguments
+  _pfx=$1; shift
+  env CX_BOTTLE_PATH="$(dirname "$_pfx")" \
+      CX_ROOT="$CX_APP/Contents/SharedSupport/CrossOver" \
+      "$(cx_wine)" "$@"
 }
 
-env_block() {
-  # $1 = want d3d12 (yes/no), $2 = want dyld (yes/no)
+# ------------------------------------------------------- bottle discovery ---
+# The one implementation of this lookup. Other tools call it rather than
+# reimplementing it, so they cannot disagree about where a bottle lives.
+
+bottle_dirs() {
+  { if [ -n "$EXTRA_DIRS" ]; then printf '%s\n' "$EXTRA_DIRS"; fi
+    if [ -n "${CX_BOTTLE_PATH:-}" ]; then
+      oIFS=$IFS; IFS=:
+      for d in $CX_BOTTLE_PATH; do printf '%s\n' "$d"; done
+      IFS=$oIFS
+    fi
+    defaults read com.codeweavers.CrossOver BottleDir 2>/dev/null
+    printf '%s\n' "$HOME/Library/Application Support/CrossOver/Bottles"
+  } | while IFS= read -r d; do
+      # Canonicalise before deduplicating: generated launchers pin these
+      # paths and are double-clicked from Finder, where a relative path means
+      # nothing.
+      [ -n "$d" ] && [ -d "$d" ] && (CDPATH= cd -- "$d" && pwd -P)
+    done | awk 'NF && !seen[$0]++'
+}
+
+bottle_path() {
+  _dirs=$(bottle_dirs)
+  oIFS=$IFS; IFS='
+'
+  for d in $_dirs; do
+    if [ -f "$d/$1/cxbottle.conf" ]; then IFS=$oIFS; printf '%s' "$d/$1"; return 0; fi
+  done
+  IFS=$oIFS
+  return 1
+}
+
+bottle_list() {
+  _dirs=$(bottle_dirs)
+  oIFS=$IFS; IFS='
+'
+  for d in $_dirs; do
+    IFS=$oIFS
+    for c in "$d"/*/cxbottle.conf; do
+      [ -f "$c" ] && basename "$(dirname "$c")"
+    done
+    IFS='
+'
+  done
+  IFS=$oIFS
+}
+
+need_bottle() {
+  _p=$(bottle_path "$1") || die "bottle '$1' not found under: $(bottle_dirs | tr '\n' ' ')"
+  printf '%s' "$_p"
+}
+
+# Is a wineserver running for THIS prefix? Wine names its socket directory
+# after the prefix's device and inode, and holds a lock inside it, so this
+# answers for one bottle instead of guessing from a process list.
+wineserver_running() {
+  _di=$(stat -f '%d %i' "$1" 2>/dev/null) || return 1
+  _lock="/tmp/.wine-$(id -u)/server-$(printf '%x' "${_di% *}")-$(printf '%x' "${_di#* }")/lock"
+  [ -f "$_lock" ] || return 1
+  [ -n "$(lsof -t "$_lock" 2>/dev/null)" ]
+}
+
+confirm() {
+  [ "$ASSUME_YES" = yes ] && return 0
+  printf '%s [y/N] ' "$1"
+  read -r _a </dev/tty 2>/dev/null || return 1
+  case $_a in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# ------------------------------------------------------------ config edit ---
+
+env_block() { # $1 d3d12  $2 dyld  $3 hud  $4 dxvk_config
   printf '%s\n' "$MARK"
   if [ "$1" = yes ]; then
     printf '"WINEDLLOVERRIDES" = "d3d11,dxgi,d3d12,d3d12core=n"\n'
   else
     printf '"WINEDLLOVERRIDES" = "d3d11,dxgi=n"\n'
   fi
-  printf '"DXVK_CONFIG" = "dxvk.enableDescriptorBuffer = False"\n'
-  printf '"DXVK_HUD" = "devinfo,fps,frametimes"\n'
+  [ -n "$4" ] && printf '"DXVK_CONFIG" = "%s"\n' "$4"
+  [ "$3" = yes ] && printf '"DXVK_HUD" = "devinfo,fps,frametimes"\n'
   printf '"DXVK_LOG_LEVEL" = "info"\n'
   printf '"WINEMSYNC" = "1"\n'
   [ "$2" = yes ] && printf '"DYLD_LIBRARY_PATH" = "%s/lib"\n' "$RUNTIME"
   printf '%s\n' "$MARK"
+  return 0
 }
 
-strip_block() {   # remove a previously written block from stdin
-  awk -v m="$MARK" 'index($0,m){s=!s; next} !s'
+# Remove any previously written block, old or new sentinel, and every stray
+# definition of a key the block owns. Reads stdin, writes stdout.
+clean_conf() {
+  awk -v m="$MARK" -v mo="$MARK_OLD" -v keys="$OWNED_KEYS" '
+    BEGIN { n = split(keys, k, " "); for (i = 1; i <= n; i++) owned[k[i]] = 1 }
+    index($0, m) || index($0, mo) { inblk = !inblk; next }
+    inblk { next }
+    {
+      line = $0
+      if (match(line, /^[ \t]*"[A-Za-z_][A-Za-z0-9_]*"/)) {
+        key = substr(line, RSTART, RLENGTH); gsub(/[" \t]/, "", key)
+        if (owned[key]) next
+      }
+      print
+    }'
 }
+
+# ----------------------------------------------------------------- setup ----
 
 cmd_setup() {
   bottle=$1; shift
-  want12=no; wantdyld=no
-  for a in "$@"; do
-    case $a in --d3d12) want12=yes ;; --dyld) wantdyld=yes ;; *) die "unknown flag $a" ;; esac
+  want12=no; wantdyld=no; wantdlss=no; wanthud=yes
+  dxvkcfg='dxvk.enableDescriptorBuffer = False'
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --d3d12) want12=yes; shift ;;
+      --dlss)  wantdlss=yes; shift ;;
+      --dyld)  wantdyld=yes; shift ;;
+      --no-hud) wanthud=no; shift ;;
+      --dxvk-config) [ $# -ge 2 ] || die "--dxvk-config needs a value"; dxvkcfg=$2; shift 2 ;;
+      --dxvk-config=*) dxvkcfg=${1#*=}; shift ;;
+      --yes|-y) ASSUME_YES=yes; shift ;;
+      *) die "unknown flag $1" ;;
+    esac
   done
-  prefix=$(find_bottle "$bottle")
+
+  prefix=$(need_bottle "$bottle")
   conf="$prefix/cxbottle.conf"
   [ -f "$conf" ] || die "no cxbottle.conf in $prefix"
-  pgrep -q wineserver && die "wineserver running - 'Quit All Applications' on the bottle first"
+  [ -x "$RUNTIME/bin/nvk-runtime" ] || die "runtime not found at $RUNTIME (pass --runtime PATH)"
 
-  echo "prefix: $prefix"
-  "$RUNTIME/bin/nvk-runtime" check "$RUNTIME"
+  if wineserver_running "$prefix"; then
+    die "a wineserver is running for this bottle -- 'Quit All Applications' on '$bottle' first"
+  fi
+
+  printf 'bottle:  %s\n' "$bottle"
+  printf 'prefix:  %s\n' "$prefix"
+  printf 'runtime: %s\n' "$RUNTIME"
+  echo
+  echo "This will:"
+  printf "  * install the runtime's DXVK into %s\n" "$prefix/drive_c/windows/system32"
+  [ "$want12" = yes ]  && echo "  * install vkd3d (d3d12, d3d12core) as well"
+  [ "$wantdlss" = yes ] && echo "  * install the runtime's DLSS/NVAPI DLLs as well"
+  printf '  * rewrite %s (backed up to cxbottle.conf.bak)\n' "$conf"
+  echo "  * set the d3d11 and dxgi DLL overrides to native in the registry"
+  echo
+  confirm "Proceed?" || { echo "aborted; nothing was changed."; exit 1; }
+
+  "$RUNTIME/bin/nvk-runtime" check "$RUNTIME" || die "the runtime failed its own check"
   "$RUNTIME/bin/nvk-runtime" install "$RUNTIME" "$prefix" \
-    || echo "  (non-zero is expected if already installed)"
+    || warn "(non-zero from install is expected if it is already installed)"
   if [ "$want12" = yes ]; then
     "$RUNTIME/bin/nvk-runtime" install-d3d12 "$RUNTIME" "$prefix" \
-      || echo "  (non-zero is expected if already installed)"
+      || warn "(non-zero from install-d3d12 is expected if it is already installed)"
+  fi
+  if [ "$wantdlss" = yes ]; then
+    CX_BOTTLE_PATH="$(dirname "$prefix")" \
+      "$RUNTIME/bin/nvk-runtime" install-dlss "$RUNTIME" "$prefix" "$(cx_wine)" --bottle "$bottle" \
+      || warn "(install-dlss returned non-zero)"
   fi
 
   [ -f "$conf.bak" ] || cp "$conf" "$conf.bak"
-  tmp=$(mktemp)
-  strip_block < "$conf" > "$tmp"
-  # drop CX_GRAPHICS_BACKEND: it makes CrossOver pick its own D3D path
-  grep -v 'CX_GRAPHICS_BACKEND' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"
+  tmp=$(mktemp) || die "could not create a temporary file"
+  clean_conf < "$conf" > "$tmp" || { rm -f "$tmp"; die "failed to rewrite $conf"; }
   grep -q '^\[EnvironmentVariables\]' "$tmp" || printf '\n[EnvironmentVariables]\n' >> "$tmp"
-  env_block "$want12" "$wantdyld" >> "$tmp"
-  mv "$tmp" "$conf"
+  env_block "$want12" "$wantdyld" "$wanthud" "$dxvkcfg" >> "$tmp" \
+    || { rm -f "$tmp"; die "failed to build the environment block"; }
+  cat "$tmp" > "$conf" && rm -f "$tmp" || { rm -f "$tmp"; die "failed to write $conf"; }
 
-  "$CXW" --bottle "$bottle" --cx-app reg add 'HKCU\Software\Wine\DllOverrides' \
-      /v d3d11 /t REG_SZ /d native /f >/dev/null 2>&1 || true
-  "$CXW" --bottle "$bottle" --cx-app reg add 'HKCU\Software\Wine\DllOverrides' \
-      /v dxgi  /t REG_SZ /d native /f >/dev/null 2>&1 || true
+  for v in d3d11 dxgi; do
+    out=$(cx_run "$prefix" --bottle "$bottle" --cx-app reg add \
+          'HKCU\Software\Wine\DllOverrides' /v "$v" /t REG_SZ /d native /f 2>&1)
+    # CrossOver's wine exits 0 even when it could not find the bottle, so the
+    # output is the only reliable signal.
+    case $out in
+      *"Unable to find"*|*"not found in"*)
+        warn "could not set the $v override: CrossOver could not open the bottle"
+        printf '%s\n' "$out" | sed 's/^/    /' >&2 ;;
+    esac
+  done
 
-  echo "setup complete (d3d12=$want12 dyld=$wantdyld). Backup: $conf.bak"
-  [ "$wantdyld" = yes ] && echo "You can now launch from CrossOver/Steam directly."
+  echo
+  printf 'setup complete (d3d12=%s dlss=%s dyld=%s). Backup: %s\n' \
+    "$want12" "$wantdlss" "$wantdyld" "$conf.bak"
+  [ "$wantdyld" = yes ] && echo "You can now launch from CrossOver or Steam directly."
+  printf "Verify with: nvk-doctor --bottle '%s'\n" "$bottle"
+  return 0
 }
+
+# ------------------------------------------------------------------- run ----
 
 cmd_run() {
   bottle=$1; app=$2; shift 2
-  prefix=$(find_bottle "$bottle")
+  prefix=$(need_bottle "$bottle")
   [ -e "$prefix/drive_c/$(printf '%s' "$app" | tr '\\' '/')" ] \
-    || echo "warning: can't see that exe under drive_c - trying anyway"
-  export CX_ROOT WINEMSYNC=1
-  export PATH="$CX_ROOT/bin:$PATH"
+    || warn "cannot see that exe under drive_c -- trying anyway"
+  PATH="$CX_APP/Contents/SharedSupport/CrossOver/bin:$PATH"
+  export PATH
   mkdir -p "$prefix/drive_c/dxvk"
-  cd "$prefix/drive_c"
-  # shellcheck disable=SC2086
+  cd "$prefix/drive_c" || die "cannot enter $prefix/drive_c"
   env WINEPREFIX="$prefix" \
+      CX_ROOT="$CX_APP/Contents/SharedSupport/CrossOver" \
+      CX_BOTTLE_PATH="$(dirname "$prefix")" \
+      WINEMSYNC=1 \
       DYLD_LIBRARY_PATH="$RUNTIME/lib" \
       DXVK_LOG_PATH='C:\dxvk' \
-      "$CXW" --bottle "$bottle" --cx-app "$app" "$@"
+      "$(cx_wine)" --bottle "$bottle" --cx-app "$app" "$@"
 }
 
+# ---------------------------------------------------------------- status ----
+
 cmd_status() {
-  prefix=$(find_bottle "$1")
-  echo "prefix: $prefix"
-  for f in d3d11 dxgi d3d12 d3d12core; do
+  prefix=$(need_bottle "$1")
+  printf 'prefix: %s\n' "$prefix"
+  if wineserver_running "$prefix"; then
+    echo "wineserver: running (this bottle)"
+  else
+    echo "wineserver: not running (this bottle)"
+  fi
+  for f in d3d11 dxgi d3d12 d3d12core nvapi64 _nvngx nvngx; do
     p="$prefix/drive_c/windows/system32/$f.dll"
-    [ -e "$p" ] && printf '  %-10s %s\n' "$f.dll" "$(shasum -a 256 "$p" | cut -c1-16)"
+    [ -e "$p" ] && printf '  %-12s %s\n' "$f.dll" "$(shasum -a 256 "$p" | cut -c1-16)"
   done
-  echo "--- cxbottle.conf env ---"
+  echo "--- cxbottle.conf [EnvironmentVariables] ---"
   sed -n '/\[EnvironmentVariables\]/,$p' "$prefix/cxbottle.conf"
 }
 
+# ------------------------------------------------------------------ undo ----
+
 cmd_undo() {
-  bottle=$1; prefix=$(find_bottle "$bottle")
-  "$RUNTIME/bin/nvk-runtime" restore "$RUNTIME" "$prefix" "$CXW" --bottle "$bottle" || true
-  [ -f "$prefix/cxbottle.conf.bak" ] && cp "$prefix/cxbottle.conf.bak" "$prefix/cxbottle.conf"
+  bottle=$1; shift
+  for a in "$@"; do
+    case $a in --yes|-y) ASSUME_YES=yes ;; *) die "unknown flag $a" ;; esac
+  done
+  prefix=$(need_bottle "$bottle")
+  if wineserver_running "$prefix"; then
+    die "a wineserver is running for this bottle -- 'Quit All Applications' on '$bottle' first"
+  fi
+  confirm "Restore '$bottle' to its pre-NVK state?" || { echo "aborted."; exit 1; }
+  CX_BOTTLE_PATH="$(dirname "$prefix")" \
+    "$RUNTIME/bin/nvk-runtime" restore "$RUNTIME" "$prefix" "$(cx_wine)" --bottle "$bottle" \
+    || warn "(restore returned non-zero)"
+  if [ -f "$prefix/cxbottle.conf.bak" ]; then
+    cp "$prefix/cxbottle.conf.bak" "$prefix/cxbottle.conf"
+    echo "cxbottle.conf restored from backup."
+  else
+    warn "no cxbottle.conf.bak found; stripping the managed block instead"
+    tmp=$(mktemp) && clean_conf < "$prefix/cxbottle.conf" > "$tmp" \
+      && cat "$tmp" > "$prefix/cxbottle.conf" && rm -f "$tmp"
+  fi
   echo "restored."
 }
 
+cmd_dlss() { # $1 = install-dlss | restore-dlss
+  verb=$1; bottle=$2
+  prefix=$(need_bottle "$bottle")
+  CX_BOTTLE_PATH="$(dirname "$prefix")" \
+    "$RUNTIME/bin/nvk-runtime" "$verb" "$RUNTIME" "$prefix" "$(cx_wine)" --bottle "$bottle"
+}
+
+# ------------------------------------------------------------------ main ----
+# Global options may appear before the subcommand or after its arguments.
+
+ARGS=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --runtime)     [ $# -ge 2 ] || die "--runtime needs a path"; RUNTIME=$2; shift 2 ;;
+    --runtime=*)   RUNTIME=${1#*=}; shift ;;
+    --crossover)   [ $# -ge 2 ] || die "--crossover needs a path"; CX_APP=$2; shift 2 ;;
+    --crossover=*) CX_APP=${1#*=}; shift ;;
+    --bottle-dir)  [ $# -ge 2 ] || die "--bottle-dir needs a path"
+                   EXTRA_DIRS="${EXTRA_DIRS}${2}
+"; shift 2 ;;
+    --bottle-dir=*) EXTRA_DIRS="${EXTRA_DIRS}${1#*=}
+"; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             ARGS="$ARGS
+$1"; shift ;;
+  esac
+done
+EXTRA_DIRS=$(printf '%s' "$EXTRA_DIRS" | awk 'NF')
+
+oIFS=$IFS; IFS='
+'
+# shellcheck disable=SC2086
+set -- $ARGS
+IFS=$oIFS
+
 case "${1:-}" in
-  setup)  shift; [ $# -ge 1 ] || die "usage: setup <bottle> [--d3d12] [--dyld]"; cmd_setup "$@" ;;
+  dirs)   bottle_dirs ;;
+  clean-conf) shift; [ $# -eq 1 ] || die "usage: clean-conf <file>"
+          [ -f "$1" ] || die "no such file: $1"; clean_conf < "$1" ;;
+  list)   bottle_list ;;
+  path)   shift; [ $# -eq 1 ] || die "usage: path <bottle>"; need_bottle "$1"; echo ;;
+  setup)  shift; [ $# -ge 1 ] || die "usage: setup <bottle> [flags]"; cmd_setup "$@" ;;
   run)    shift; [ $# -ge 2 ] || die "usage: run <bottle> '<exe path under drive_c>' [args]"; cmd_run "$@" ;;
   status) shift; [ $# -eq 1 ] || die "usage: status <bottle>"; cmd_status "$1" ;;
-  undo)   shift; [ $# -eq 1 ] || die "usage: undo <bottle>"; cmd_undo "$1" ;;
-  *) sed -n '2,20p' "$0"; exit 1 ;;
+  undo)   shift; [ $# -ge 1 ] || die "usage: undo <bottle> [--yes]"; cmd_undo "$@" ;;
+  install-dlss|restore-dlss)
+          v=$1; shift; [ $# -eq 1 ] || die "usage: $v <bottle>"; cmd_dlss "$v" "$1" ;;
+  ''|help) usage; exit 1 ;;
+  *)      die "unknown command: $1 (try --help)" ;;
 esac

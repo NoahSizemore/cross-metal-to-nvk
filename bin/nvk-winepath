@@ -1,0 +1,182 @@
+#!/bin/sh
+# nvk-winepath -- map between unix paths and a bottle's Windows paths.
+#
+#   nvk-winepath drives   <bottle|prefix>
+#   nvk-winepath to-win   <bottle|prefix> <unix-path>
+#   nvk-winepath from-win <bottle|prefix> <windows-path>
+#
+# The mapping is whatever the bottle's dosdevices symlinks say, which is the
+# only answer that is right when a Steam library sits on a second volume: such
+# a library is not under C:, and guessing that it is produces a path the game
+# will never find.
+#
+# drives    - TSV of drive letter and the unix directory it points at.
+# to-win    - the Windows path for a unix path. The longest matching drive
+#             wins, so drive_c beats Z: even though Z: is usually "/".
+# from-win  - the unix path for a Windows path. Drive letters are matched
+#             case-insensitively.
+#
+# A path that does not exist yet still maps: only the deepest existing parent
+# is resolved, and the remainder is carried through.
+#
+# Options:
+#   --bottle-dir PATH   passed to nvk-bottle when resolving a bottle by name
+#   -h, --help
+#
+# Exit: 0 success, 1 error (including "no drive covers that path").
+
+set -u
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+EXTRA_DIR=
+
+# Forwarded as two real arguments, never as a string holding a flag: this
+# domain is full of paths with spaces in it -- CrossOver's own default bottle
+# directory has one -- and an unquoted expansion would split them.
+nvk_bottle() {
+  if [ -n "$EXTRA_DIR" ]; then "$HERE/nvk-bottle" --bottle-dir "$EXTRA_DIR" "$@"
+  else "$HERE/nvk-bottle" "$@"; fi
+}
+
+die() { printf 'nvk-winepath: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# A bottle name or a prefix path, resolved to a prefix path.
+resolve_prefix() {
+  if [ -d "$1/dosdevices" ] || [ -f "$1/cxbottle.conf" ]; then
+    printf '%s' "$1"; return 0
+  fi
+  case $1 in
+    */*) die "no bottle at '$1' (no dosdevices directory)" ;;
+  esac
+  p=$(nvk_bottle path "$1" 2>/dev/null) \
+    || die "bottle '$1' not found, and it is not a prefix path"
+  printf '%s' "$p"
+}
+
+# Absolute, symlink-resolved, and tolerant of a path that does not exist yet.
+resolve_path() {
+  p=$1
+  case $p in /*) ;; *) p="$PWD/$p" ;; esac
+  # Walk up with parameter expansion rather than basename/dirname: this loop
+  # must not depend on anything in PATH, and it must always terminate.
+  d=$p; tail=; guard=0
+  while [ ! -d "$d" ]; do
+    guard=$((guard + 1))
+    [ "$guard" -gt 256 ] && return 1
+    b=${d##*/}
+    d=${d%/*}
+    [ -n "$d" ] || d=/
+    tail=${tail:+$b/$tail}; tail=${tail:-$b}
+    [ "$d" = / ] && break
+  done
+  r=$(cd "$d" 2>/dev/null && pwd -P) || return 1
+  case $r in /) r= ;; esac
+  [ -n "$tail" ] && r="$r/$tail"
+  printf '%s' "${r:-/}"
+}
+
+# TSV: letter <tab> resolved target. Device nodes ("d::") are not drives.
+drives() {
+  dd="$1/dosdevices"
+  [ -d "$dd" ] || die "no dosdevices directory in $1"
+  for e in "$dd"/*; do
+    [ -e "$e" ] || continue
+    n=$(basename "$e")
+    case $n in
+      [a-zA-Z]:) ;;
+      *) continue ;;
+    esac
+    t=$(resolve_path "$e") || continue
+    [ -d "$t" ] || continue
+    printf '%s\t%s\n' "$(printf '%s' "${n%:}" | tr 'a-z' 'A-Z')" "$t"
+  done
+}
+
+cmd_to_win() {
+  prefix=$1
+  target=$(resolve_path "$2") || die "cannot resolve '$2'"
+  best_letter=; best_target=; best_len=-1
+  tbl=$(drives "$prefix")
+  oIFS=$IFS; IFS='
+'
+  for row in $tbl; do
+    IFS=$oIFS
+    letter=${row%%	*}; dir=${row#*	}
+    # Match only at a path-component boundary, so /Volumes/Data does not
+    # count as a prefix of /Volumes/Data2.
+    case $dir in
+      /) matched=yes ;;
+      *) case "$target/" in "$dir/"*) matched=yes ;; *) matched=no ;; esac ;;
+    esac
+    if [ "$matched" = yes ]; then
+      len=${#dir}
+      [ "$dir" = / ] && len=0
+      # Longest wins; C: breaks a tie, since a bottle's own drive_c is the
+      # more useful answer when two drives point at the same directory.
+      if [ "$len" -gt "$best_len" ] || { [ "$len" -eq "$best_len" ] && [ "$letter" = C ]; }; then
+        best_len=$len; best_letter=$letter; best_target=$dir
+      fi
+    fi
+    IFS='
+'
+  done
+  IFS=$oIFS
+
+  [ -n "$best_letter" ] || die "no drive in this bottle covers $target"
+  rest=${target#"$best_target"}
+  case $best_target in /) rest=$target ;; esac
+  rest=$(printf '%s' "$rest" | sed 's|^/||' | tr '/' '\\')
+  if [ -z "$rest" ]; then
+    printf '%s:\\\n' "$best_letter"
+  else
+    printf '%s:\\%s\n' "$best_letter" "$rest"
+  fi
+}
+
+cmd_from_win() {
+  prefix=$1; win=$2
+  case $win in
+    [a-zA-Z]:*) ;;
+    \\\\*) die "UNC paths are not supported: $win" ;;
+    *) die "not an absolute Windows path (expected a drive letter): $win" ;;
+  esac
+  letter=$(printf '%s' "$win" | cut -c1 | tr 'a-z' 'A-Z')
+  rest=$(printf '%s' "$win" | cut -c3- | tr '\\' '/')
+  dir=$(drives "$prefix" | awk -F'\t' -v l="$letter" '$1 == l { print $2; exit }')
+  [ -n "$dir" ] || die "this bottle has no $letter: drive"
+  case $dir in /) dir= ;; esac
+  rest=$(printf '%s' "$rest" | sed 's|^/||')
+  if [ -z "$rest" ]; then printf '%s\n' "${dir:-/}"; else printf '%s/%s\n' "$dir" "$rest"; fi
+}
+
+ARGS=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --bottle-dir)   [ $# -ge 2 ] || die "--bottle-dir needs a path"
+                    EXTRA_DIR=$2; shift 2 ;;
+    --bottle-dir=*) EXTRA_DIR=${1#*=}; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    --)             shift; break ;;
+    -*)             die "unknown option: $1" ;;
+    *)              ARGS="$ARGS
+$1"; shift ;;
+  esac
+done
+
+oIFS=$IFS; IFS='
+'
+# shellcheck disable=SC2086
+set -- $ARGS
+IFS=$oIFS
+
+case "${1:-}" in
+  drives)   shift; [ $# -eq 1 ] || die "usage: drives <bottle|prefix>"
+            drives "$(resolve_prefix "$1")" ;;
+  to-win)   shift; [ $# -eq 2 ] || die "usage: to-win <bottle|prefix> <unix-path>"
+            cmd_to_win "$(resolve_prefix "$1")" "$2" ;;
+  from-win) shift; [ $# -eq 2 ] || die "usage: from-win <bottle|prefix> <windows-path>"
+            cmd_from_win "$(resolve_prefix "$1")" "$2" ;;
+  ''|help)  usage; exit 1 ;;
+  *)        die "unknown command: $1 (try --help)" ;;
+esac

@@ -98,7 +98,16 @@ Lowering output resolution reduces it proportionally.
 
 ## Reporting these upstream
 
-Include `bin/nvk-doctor` output, which captures driver version, runtime build
-ID, ICD enumeration and recent refusals. Quote the driver's own diagnostic text
-verbatim — it is precise, and paraphrasing it loses the detail that makes each
-of these actionable.
+All three are written up as submission-ready reports in
+[upstream/](upstream/) — environment, observation, the driver's own diagnostic
+quoted verbatim, and what the honest behaviour would be. **They have not been
+submitted.**
+
+If you send one, re-run `bin/nvk-doctor` first and replace the environment
+block. The versions in those reports were read from one machine on one day, and
+the runtime has already moved underneath this documentation once: the
+`nvk-runtime` binary and its own `BUILD.json` currently disagree about which
+build they are.
+
+Quote the driver's diagnostic text exactly. It is precise, and paraphrasing it
+loses the detail that makes each of these actionable.

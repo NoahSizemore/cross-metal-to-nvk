@@ -1,7 +1,6 @@
-# nvk-crossover
+# cross-metal-to-nvk
 
-Run Windows games in CrossOver on an **Intel Hackintosh** through the **native
-NVK** NVIDIA path, instead of CrossOver's default Metal translation.
+Run Windows games in CrossOver on an **Intel Hackintosh** through the **nativeNVK** NVIDIA path, instead of CrossOver's default Metal translation.
 
 These are configuration scripts. They ship **no binaries** and redistribute
 nothing — you install NullMoth's NVIDIA driver and its Wine/NVK runtime
@@ -16,7 +15,7 @@ yourself, and these tools point CrossOver at it.
 
 ## What this is not
 
-* **Not a driver.** You install the NullMoth driver 3.0+ *including its Wine
+* **Not a driver.** You install NullMoth's driver *including its Wine
   runtime*. This repo contains shell scripts and documentation only.
 * **Not for Apple Silicon.** Use D3DMetal / Game Porting Toolkit there. This
   path requires a real NVIDIA GPU on an Intel machine.
@@ -77,41 +76,71 @@ The symptom is `Failed to create DirectX 11 render device!`.
 
 ## Requirements
 
-* Intel Mac or Hackintosh (x86_64), macOS 15.5+ or Tahoe 26
-* NVIDIA Turing or newer
-* NullMoth driver 3.0+ **including the Wine runtime** at
+* Intel Mac or Hackintosh (x86_64)
+* macOS 15 or newer — the runtime is built against the macOS 15 SDK
+* NVIDIA Turing or newer (RTX 20 / GTX 16 and later)
+* NullMoth's driver **including the Wine runtime** at
   `/Library/GPUBundles/nvmtl/wine`
 * CrossOver (verified against 26.3)
 
-Verify the runtime before anything else:
+There is deliberately no version number for the driver here. Its bundle and its
+runtime report different identifiers, and they have already disagreed with each
+other on the reference machine — so check the capability, not the label:
 
 ```sh
 /Library/GPUBundles/nvmtl/wine/bin/nvk-runtime check /Library/GPUBundles/nvmtl/wine
 ```
+
+You want `"result" : "PASS"`. `nvk-doctor` runs this for you and prints both
+identifiers side by side.
 
 ---
 
 ## Quick start
 
 ```sh
-git clone <this repo> && cd nvk-crossover
+git clone <this repo> && cd cross-metal-to-nvk
+./bin/nvk-setup
+```
 
-# 1. Check the machine. Read-only; changes nothing.
-./bin/nvk-doctor
+`nvk-setup` runs the whole arc and asks before each step that changes
+anything: check the machine, configure the bottle, find the game, pick its
+executable, warn about anticheat, write a profile, generate the launchers.
+
+Every question it asks is also a flag, so a working setup reproduces as one
+line — which is what a bug report should contain:
+
+```sh
+./bin/nvk-setup --bottle Steam --game Deadlock --args '-dx11' --yes
+```
+
+### Or do it by hand
+
+```sh
+# 1. Check the machine. Read-only; changes nothing, and never needs sudo.
+#    Exit status is the gate: 0 ready, 2 usable with caveats, 1 do not continue.
+./bin/nvk-doctor                    # host, GPU, driver, runtime, Vulkan, CrossOver
+./bin/nvk-doctor --bottle Steam     # ...and one bottle's DXVK and configuration
 
 # 2. Configure a bottle. Installs the runtime's DXVK into the prefix and
 #    writes the Wine environment block into cxbottle.conf, backing it up first.
-#    Quit all applications in the bottle before running this.
+#    It asks before touching the file, and needs the bottle's apps closed.
 ./bin/nvk-bottle setup Steam
 
-# 3. Generate launchers. The two-app split is the documented default:
+# 3. Find the game and its executable. Output is tab-separated.
+./bin/nvk-steam games Steam
+./bin/nvk-steam exes "/path/from/the/previous/command"
+./bin/nvk-winepath to-win Steam "/path/to/the/chosen.exe"
+
+# 4. Generate launchers. The two-app split is the documented default:
 #    one app to start Steam under NVK, one for the game itself.
 ./bin/nvk-mkapp --bottle Steam \
   --app 'C:\Program Files (x86)\Steam\steam.exe' --name 'Steam (NVK)'
 
 ./bin/nvk-mkapp --bottle Steam \
   --app 'C:\...\game\bin\win64\yourgame.exe' \
-  --name 'Your Game (NVK)' --args '-dx11'
+  --name 'Your Game (NVK)' --args '-dx11' \
+  --save-profile profiles/your-game-123456.conf
 ```
 
 Launchers land in `~/Applications` and log to `~/Library/Logs/nvk-<name>.log`.
@@ -129,6 +158,10 @@ Launchers land in `~/Applications` and log to `~/Library/Logs/nvk-<name>.log`.
 * `nvk-mkapp --needs-steam` starts Steam first and waits for it. This is a
   convenience that may not work everywhere — prefer the two-app split.
 * `nvk-mkapp --icon-from '/path/to/some.app'` borrows an icon.
+* `nvk-mkapp --regenerate-all` rebuilds every launcher from `profiles/`. Run it
+  after a runtime or CrossOver update, since generated launchers pin their
+  paths (design rule 6) and therefore go stale.
+* `nvk-setup --dry-run` shows the whole plan and writes nothing.
 
 ---
 
@@ -189,7 +222,32 @@ including two driver bugs that cause silent visual corruption.
 |---|---|
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptoms, causes, fixes |
 | [docs/DRIVER-ISSUES.md](docs/DRIVER-ISSUES.md) | Upstream driver findings with reproduction detail |
+| [docs/upstream/](docs/upstream/) | The same three findings, written as reports ready to submit |
 | [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) | Per-game notes, anticheat, Steam launch caveats |
+| [profiles/README.md](profiles/README.md) | The profile format |
+| [tests/fixtures/README.md](tests/fixtures/README.md) | What the fixtures stand in for |
+
+---
+
+## Tests
+
+```sh
+./tests/run.sh
+```
+
+No GPU, no CrossOver and no Steam required: the suite runs against fixtures in
+`tests/fixtures/`, which provide a bottle with two drives, two Steam library
+roots, a game whose folder is not its name, a game on a second volume, and a
+game whose name is a quoting attack. Stand-ins for CrossOver and the runtime
+let launcher generation be tested on a machine that has neither, and further
+fixtures cover a bottle directory containing a space, a manifest with Windows
+line endings, and bottles in both configured and unconfigured states.
+
+That split is deliberate. The reference machine has one GPU, one Steam bottle
+and two games, so the layouts this tooling claims to handle cannot be tested
+against it. Parsing is written as pure functions over files, and the tests
+drive those. Anything that genuinely needs *this* hardware is `nvk-doctor`'s
+job, not the suite's.
 
 ---
 
@@ -197,13 +255,36 @@ including two driver bugs that cause silent visual corruption.
 
 ```
 bin/
-  nvk-doctor        preflight check and bug-report dump (read-only)
-  nvk-bottle        setup / run / status / undo for a CrossOver bottle
-  nvk-mkapp         generates .app launchers
+  nvk-setup         the guided front door; drives everything below  (zsh)
+  nvk-doctor        preflight gate and bug-report dump (read-only)
+  nvk-bottle        dirs / list / path / setup / run / status / undo,
+                    plus install-dlss / restore-dlss and clean-conf
+  nvk-steam         root / libraries / games / exes / anticheat, plus the
+                    parsers (kv, parse-acf, parse-libraryfolders) on their own
+  nvk-winepath      drives / to-win / from-win, via the bottle's dosdevices
+  nvk-profile       list / path / read / write / validate / name
+  nvk-mkapp         generates .app launchers from a profile or from flags
   vk-icd-probe.py   enumerates the NVK ICD via ctypes; no Vulkan SDK needed
-profiles/           per-game profiles (launch args, dxvk fragments, known issues)
-tests/fixtures/     sample Steam manifests for testing discovery logic offline
+profiles/           per-game profiles: the output of record (yours are
+                    gitignored; they record your own paths)
+tests/              the suite, and fixtures that stand in for other machines
 docs/               shipping documentation
+```
+
+`nvk-setup` is the only `zsh` script, because building menus in POSIX `sh`
+without arrays is miserable and `zsh` is guaranteed present on macOS. It calls
+the others **as subprocesses**, reading their tab-separated output; nothing is
+sourced across the `zsh`/`sh` boundary, where word-splitting rules differ.
+Everything else is `#!/bin/sh`.
+
+Each tool is usable on its own, which is the point: the wizard is a driver, not
+a fourth implementation of anything.
+
+```sh
+nvk-steam games Steam                    # appid, name, installdir, path, present
+nvk-steam exes "<game dir>"              # score, size, path  (best first)
+nvk-winepath to-win Steam "<unix path>"  # the Windows path, via dosdevices
+nvk-profile  validate profiles/*.conf
 ```
 
 ---
@@ -215,8 +296,10 @@ These are constraints, not preferences. Changes that violate them are bugs.
 1. **Never redistribute the runtime.** It is PolyForm Noncommercial and bundles
    NVIDIA's NGX license. Scripts only; verify the user's copy with
    `nvk-runtime check`.
-2. **Never require sudo.** Nothing here needs it, and the scripts refuse to run
-   as root.
+2. **Never require sudo.** Nothing here needs it. The tools that change
+   something — `nvk-setup`, `nvk-bottle`, `nvk-mkapp` — refuse to run as root.
+   `nvk-doctor` only warns, because refusing to produce a diagnostic report
+   helps nobody, and the read-only query tools do not check at all.
 3. **Reversible by construction.** Back up `cxbottle.conf` before editing it,
    mark additions with a sentinel so re-runs replace rather than duplicate, and
    keep `undo` a first-class command.
@@ -235,17 +318,42 @@ This repository is mid-refactor from single-machine scripts to something any
 nullintosh user can run. Current state and direction:
 
 - [x] Repository structure, licensing, documentation skeleton
-- [ ] `nvk-doctor` as a machine-agnostic preflight gate (currently hardcoded to
-      one bottle and one game)
-- [ ] Steam discovery: multiple library roots, `appmanifest` parsing, executable
+- [x] `nvk-doctor` as a machine-agnostic preflight gate
+- [x] Steam discovery: multiple library roots, `appmanifest` parsing, executable
       ranking, unix↔Windows path mapping — with offline fixtures
-- [ ] Per-game profile format, and `nvk-mkapp --regenerate-all` to rebuild every
+- [x] Per-game profile format, and `nvk-mkapp --regenerate-all` to rebuild every
       launcher after a runtime or CrossOver update
-- [ ] `nvk-setup`: a guided front door that runs the whole arc
-- [ ] File the driver findings upstream
+- [x] `nvk-setup`: a guided front door that runs the whole arc
+- [ ] File the driver findings upstream — written up ready to send in
+      [docs/upstream/](docs/upstream/), not yet submitted
+- [ ] A second machine. Everything above is tested; *tested* here means against
+      fixtures and one RTX 4070. See [Coverage](#coverage).
 
-Non-Steam sources (Epic, GOG) are out of scope for the first release, but the
-profile format does not assume Steam.
+Non-Steam sources (Epic, GOG) are out of scope for the first release, but only
+discovery assumes Steam: the profile format does not, and `nvk-mkapp` will take
+any Windows path.
+
+---
+
+## Coverage
+
+Honest version: **one configuration.** RTX 4070, i7-13700K Hackintosh, macOS 26,
+CrossOver 26.3, two games, one of which is the one everything was developed
+against.
+
+What that means in practice:
+
+* The parsing is covered by a test suite that runs anywhere, against fixtures
+  built to be *unlike* this machine — second volumes, folder names that are not
+  game names, Unreal layouts, hostile game names.
+* The hardware gate (`nvk-doctor`) is machine-agnostic by construction: it
+  reads versions and hashes from disk rather than asserting values, so it
+  reports what your machine has rather than what mine had.
+* Everything that happens *after* a launcher starts — whether a given game
+  runs, how fast, and what it looks like — is one data point.
+
+If you run `nvk-doctor` on another machine, that output is worth more to this
+project than any feature request.
 
 ---
 

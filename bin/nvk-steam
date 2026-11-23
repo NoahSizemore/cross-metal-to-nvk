@@ -1,0 +1,289 @@
+#!/bin/sh
+# nvk-steam -- find Steam, its libraries, its games, and their executables.
+#
+#   nvk-steam root      <bottle>                 the Steam install directory
+#   nvk-steam libraries <bottle>                 every library root, unix paths
+#   nvk-steam games     <bottle> [--all]         TSV of installed games
+#   nvk-steam exes      <game-dir>  [--all]      TSV of ranked executables
+#   nvk-steam anticheat <game-dir>               anticheat binaries, if any
+#
+# Parsing sub-commands. These touch nothing but the file named, which is how
+# they are tested against fixtures from machines no one here owns:
+#
+#   nvk-steam kv <file>                depth, key, value for any Valve KeyValues
+#   nvk-steam parse-acf <file>         appid, name, installdir from appmanifest
+#   nvk-steam parse-libraryfolders <file>   library paths, as the file spells them
+#
+# Notes that cost real debugging to learn:
+#   * Libraries are plural. libraryfolders.vdf is the index, and a root on a
+#     second volume is normal.
+#   * The folder is not the name. "Counter-Strike Global Offensive" is the
+#     installdir of "Counter-Strike 2"; only appmanifest_*.acf knows both.
+#   * The executable is not predictable. game/bin/win64 is a Source 2 habit,
+#     not a rule, and most games ship launchers and crash handlers too, so
+#     candidates are ranked and the caller chooses.
+#
+# Options:
+#   --all              do not filter: keep Steam's own non-game entries, and
+#                      keep executables that ranking would otherwise drop
+#   --steam-root PATH  unix path to the Steam directory, skipping discovery
+#   --bottle-dir PATH  passed through to nvk-bottle when resolving a name
+#   -h, --help
+#
+# Output is tab-separated so that callers can read it without a parser, and
+# so a game named with spaces, quotes or parentheses survives the trip.
+
+set -u
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+EXTRA_DIR=
+STEAM_ROOT=
+SHOW_ALL=no
+
+die() { printf 'nvk-steam: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# Forwarded as two real arguments, never as a string holding a flag: this
+# domain is full of paths with spaces in it -- CrossOver's own default bottle
+# directory has one -- and an unquoted expansion would split them.
+winepath() {
+  if [ -n "$EXTRA_DIR" ]; then "$HERE/nvk-winepath" --bottle-dir "$EXTRA_DIR" "$@"
+  else "$HERE/nvk-winepath" "$@"; fi
+}
+
+resolve_prefix() {
+  if [ -d "$1/dosdevices" ] || [ -f "$1/cxbottle.conf" ]; then printf '%s' "$1"; return 0; fi
+  case $1 in */*) die "no bottle at '$1'" ;; esac
+  if [ -n "$EXTRA_DIR" ]; then p=$("$HERE/nvk-bottle" --bottle-dir "$EXTRA_DIR" path "$1" 2>/dev/null)
+  else p=$("$HERE/nvk-bottle" path "$1" 2>/dev/null); fi
+  [ -n "$p" ] || die "bottle '$1' not found, and it is not a prefix path"
+  printf '%s' "$p"
+}
+
+# ------------------------------------------------------- KeyValues parser ---
+# Valve's format, used by both libraryfolders.vdf and appmanifest_*.acf.
+# Pure: one file in, "depth<TAB>key<TAB>value" out. A line holding one string
+# is a section name; two strings are a key and its value.
+
+kv() {
+  awk '
+    function scan(line, out,   i, c, inq, esc, cur, n) {
+      n = 0; inq = 0; esc = 0; cur = ""
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        if (inq && esc)      { cur = cur c; esc = 0; continue }
+        if (inq && c == "\\"){ esc = 1; continue }
+        if (c == "\"") {
+          if (inq) { out[++n] = cur; cur = ""; inq = 0 } else { inq = 1 }
+          continue
+        }
+        if (inq) cur = cur c
+      }
+      return n
+    }
+    {
+      # These files can arrive with Windows line endings -- copied from a
+      # Windows install, or written by a different Steam build. A trailing
+      # carriage return would otherwise stop "{" from being recognised, and
+      # every key would be recorded at the wrong depth.
+      sub(/\r$/, "")
+      stripped = $0
+      sub(/^[ \t]+/, "", stripped)
+      sub(/[ \t]+$/, "", stripped)
+      if (stripped == "{") { depth++; next }
+      if (stripped == "}") { depth--; next }
+      n = scan($0, tok)
+      if (n >= 2)      printf "%d\t%s\t%s\n", depth, tok[1], tok[2]
+      else if (n == 1) printf "%d\t%s\t\n",   depth, tok[1]
+    }' "$1"
+}
+
+parse_acf() {
+  kv "$1" | awk -F'\t' '
+    $1 == 1 && $2 == "appid"      { appid = $3 }
+    $1 == 1 && $2 == "name"       { name = $3 }
+    $1 == 1 && $2 == "installdir" { dir = $3 }
+    END {
+      if (appid == "" && name == "" && dir == "") exit 1
+      printf "%s\t%s\t%s\n", appid, name, dir
+    }'
+}
+
+parse_libraryfolders() {
+  kv "$1" | awk -F'\t' '$2 == "path" && $3 != "" { print $3 }'
+}
+
+# --------------------------------------------------------------- discovery --
+
+# Always canonical, so that `root` and `libraries` agree and a caller can strip
+# one path from the other as a string. A temp directory under /var is a symlink
+# to /private/var on macOS, which is exactly where this used to diverge.
+canon() { (CDPATH= cd -- "$1" 2>/dev/null && pwd -P); }
+
+steam_root() { # $1 = prefix
+  if [ -n "$STEAM_ROOT" ]; then
+    [ -d "$STEAM_ROOT" ] || die "--steam-root is not a directory: $STEAM_ROOT"
+    canon "$STEAM_ROOT"; return 0
+  fi
+  for c in "Program Files (x86)/Steam" "Program Files/Steam"; do
+    [ -d "$1/drive_c/$c/steamapps" ] && { canon "$1/drive_c/$c"; return 0; }
+  done
+  # The registry knows where Steam put itself when it is somewhere unusual.
+  for reg in "$1/user.reg" "$1/system.reg"; do
+    [ -f "$reg" ] || continue
+    w=$(sed -n 's/^"SteamPath"="\(.*\)"$/\1/p' "$reg" | head -1)
+    [ -n "$w" ] || continue
+    w=$(printf '%s' "$w" | sed 's|\\\\|\\|g')
+    u=$(winepath from-win "$1" "$w" 2>/dev/null) || continue
+    [ -d "$u/steamapps" ] && { canon "$u"; return 0; }
+  done
+  return 1
+}
+
+libraries() { # $1 = prefix, $2 = steam root
+  # The primary root is also listed in libraryfolders.vdf, and a root can be
+  # spelled more than one way, so canonicalise before deduplicating.
+  { printf '%s\n' "$2"
+    vdf="$2/steamapps/libraryfolders.vdf"
+    if [ -f "$vdf" ]; then
+      parse_libraryfolders "$vdf" | while IFS= read -r win; do
+        [ -n "$win" ] || continue
+        case $win in
+          /*) printf '%s\n' "$win" ;;                 # already a unix path
+          *)  winepath from-win "$1" "$win" 2>/dev/null ;;
+        esac
+      done
+    fi
+  } | while IFS= read -r d; do
+        [ -n "$d" ] && [ -d "$d/steamapps" ] || continue
+        (CDPATH= cd -- "$d" && pwd -P)
+      done | awk 'NF && !seen[$0]++'
+}
+
+# Steam's own plumbing is installed like a game but is not one.
+is_junk_app() { # $1 appid, $2 name
+  case $1 in 228980|1070560|1391110|1493710|1628350|2180100|2805730) return 0 ;; esac
+  case $2 in
+    "Steamworks Common Redistributables"|"Steam Linux Runtime"*|"Proton "*|"Steamworks Shared")
+      return 0 ;;
+  esac
+  return 1
+}
+
+games() { # $1 = prefix, $2 = steam root
+  libraries "$1" "$2" | while IFS= read -r lib; do
+    for acf in "$lib"/steamapps/appmanifest_*.acf; do
+      [ -f "$acf" ] || continue
+      row=$(parse_acf "$acf") || continue
+      appid=${row%%	*}; rest=${row#*	}
+      name=${rest%%	*}; installdir=${rest##*	}
+      [ -n "$appid" ] || continue
+      [ "$SHOW_ALL" = yes ] || ! is_junk_app "$appid" "$name" || continue
+      dir="$lib/steamapps/common/$installdir"
+      [ -d "$dir" ] && present=yes || present=no
+      printf '%s\t%s\t%s\t%s\t%s\n' "$appid" "$name" "$installdir" "$dir" "$present"
+    done
+  done
+}
+
+# ------------------------------------------------------ executable ranking --
+# Every engine lays its binaries out differently, so rank candidates instead of
+# asserting a layout, and let the caller pick from the top.
+
+exes() { # $1 = game dir
+  [ -d "$1" ] || die "not a directory: $1"
+  # Strip trailing slashes: the relative path below is computed by length, so
+  # "dir/" and "dir" must not disagree about where the prefix ends.
+  _root=$1
+  while [ "${_root%/}" != "$_root" ] && [ "$_root" != / ]; do _root=${_root%/}; done
+  gamedir_name=$(basename "$_root")
+  find "$_root" -type f -iname '*.exe' -exec stat -f '%z %N' {} + 2>/dev/null | awk -v root="$_root" -v gname="$gamedir_name" -v showall="$SHOW_ALL" '
+    function lower(s) { return tolower(s) }
+    {
+      size = $1 + 0
+      path = substr($0, index($0, " ") + 1)
+      rel  = substr(path, length(root) + 2)
+      lrel = lower(rel)
+      base = rel; sub(/.*\//, "", base)
+      lbase = lower(base)
+      stem = lbase; sub(/\.exe$/, "", stem)
+
+      drop = 0
+      # Shipped third-party installers and engine tooling: never the game.
+      if (lrel ~ /(^|\/)(_commonredist|commonredist|redist|directx|dotnet|dxsetup|vcredist)/) drop = 1
+      if (lbase ~ /^(unins|setup|install|dxsetup|dxwebsetup|vcredist|vc_redist|dotnetfx|oalinst|ue4prereqsetup|ueprereqsetup)/) drop = 1
+      if (lbase ~ /(crashhandler|crashreport|crashsender|unins[0-9]*)/) drop = 1
+      if (lbase ~ /^(unrealeditor|unrealcefsubprocess|unrealpak|shadercompileworker|epicwebhelper)/) drop = 1
+      # Anticheat services are reported separately; they are not the game.
+      if (lbase ~ /(easyanticheat|beservice|battleye|bedaisy|vgtray|vgc)/) drop = 1
+      if (drop && showall != "yes") next
+
+      score = 100
+      if (lrel ~ /(^|\/)(game\/)?bin\/win64\//)   score += 40
+      else if (lrel ~ /binaries\/win64\//)        score += 40
+      else if (lrel ~ /(^|\/)(win64|x64|bin64)\//) score += 20
+      if (lrel !~ /\//)                           score += 15   # at the top level
+      if (stem == lower(gname))                   score += 25
+      else if (index(lower(gname), stem) == 1 || index(stem, lower(gname)) == 1) score += 12
+      if (lbase ~ /launcher/)                     score -= 50
+      if (lrel  ~ /(^|\/)engine\//)               score -= 30
+      if (lbase ~ /(server|dedicated|editor|benchmark|console|vconsole|tool|config|report|helper|updater|patcher)/) score -= 25
+      if (drop) score -= 200
+      # Size is the tiebreak, not a factor: a 2 GB launcher is still a launcher.
+      printf "%d\t%d\t%s\n", score, size, path
+    }' | sort -t'	' -k1,1nr -k2,2nr
+}
+
+anticheat() { # $1 = game dir
+  [ -d "$1" ] || die "not a directory: $1"
+  find "$1" \( -type f -o -type d \) \
+       \( -iname 'EasyAntiCheat*' -o -iname 'BEService*' -o -iname 'BattlEye*' \
+          -o -iname '*_EAC*' -o -iname 'BEDaisy*' -o -iname 'vgc.exe' \) \
+       2>/dev/null | sort
+}
+
+# ------------------------------------------------------------------- main ---
+
+ARGS=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --all)           SHOW_ALL=yes; shift ;;
+    --steam-root)    [ $# -ge 2 ] || die "--steam-root needs a path"; STEAM_ROOT=$2; shift 2 ;;
+    --steam-root=*)  STEAM_ROOT=${1#*=}; shift ;;
+    --bottle-dir)    [ $# -ge 2 ] || die "--bottle-dir needs a path"; EXTRA_DIR=$2; shift 2 ;;
+    --bottle-dir=*)  EXTRA_DIR=${1#*=}; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    --)              shift; break ;;
+    -*)              die "unknown option: $1" ;;
+    *)               ARGS="$ARGS
+$1"; shift ;;
+  esac
+done
+
+oIFS=$IFS; IFS='
+'
+# shellcheck disable=SC2086
+set -- $ARGS
+IFS=$oIFS
+
+case "${1:-}" in
+  root)      shift; [ $# -eq 1 ] || die "usage: root <bottle>"
+             p=$(resolve_prefix "$1"); r=$(steam_root "$p") || die "no Steam install found in $p"
+             printf '%s\n' "$r" ;;
+  libraries) shift; [ $# -eq 1 ] || die "usage: libraries <bottle>"
+             p=$(resolve_prefix "$1"); r=$(steam_root "$p") || die "no Steam install found in $p"
+             libraries "$p" "$r" ;;
+  games)     shift; [ $# -eq 1 ] || die "usage: games <bottle>"
+             p=$(resolve_prefix "$1"); r=$(steam_root "$p") || die "no Steam install found in $p"
+             games "$p" "$r" ;;
+  exes)      shift; [ $# -eq 1 ] || die "usage: exes <game-dir>"; exes "$1" ;;
+  anticheat) shift; [ $# -eq 1 ] || die "usage: anticheat <game-dir>"; anticheat "$1" ;;
+  kv)        shift; [ $# -eq 1 ] || die "usage: kv <file>"; [ -f "$1" ] || die "no such file: $1"; kv "$1" ;;
+  parse-acf) shift; [ $# -eq 1 ] || die "usage: parse-acf <file>"; [ -f "$1" ] || die "no such file: $1"
+             parse_acf "$1" || die "no appid, name or installdir in $1" ;;
+  parse-libraryfolders)
+             shift; [ $# -eq 1 ] || die "usage: parse-libraryfolders <file>"
+             [ -f "$1" ] || die "no such file: $1"; parse_libraryfolders "$1" ;;
+  ''|help)   usage; exit 1 ;;
+  *)         die "unknown command: $1 (try --help)" ;;
+esac
