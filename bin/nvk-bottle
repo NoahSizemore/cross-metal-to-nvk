@@ -1,0 +1,139 @@
+#!/bin/sh
+# Native NVK for any CrossOver bottle.
+#
+#   sh nvk-bottle.sh setup  <bottle> [--d3d12] [--dyld]
+#   sh nvk-bottle.sh run    <bottle> '<path\relative\to\drive_c.exe>' [args...]
+#   sh nvk-bottle.sh status <bottle>
+#   sh nvk-bottle.sh undo   <bottle>
+#
+# setup  - installs the runtime's DXVK (and optionally vkd3d) into the prefix and
+#          writes the Wine env block into cxbottle.conf. Run once per bottle.
+#          --dyld also puts DYLD_LIBRARY_PATH in cxbottle.conf, which lets you
+#          launch from CrossOver's GUI / Steam's Play button with no script.
+#          (The runtime README advises against setting it globally; per-bottle is
+#          narrower, but if the bottle misbehaves, re-run setup without --dyld.)
+# run    - launches one app with the environment set explicitly (always works,
+#          even without --dyld).
+
+set -eu
+
+RUNTIME=/Library/GPUBundles/nvmtl/wine
+CX_ROOT='/Applications/CrossOver.app/Contents/SharedSupport/CrossOver'
+CXW="$CX_ROOT/bin/wine"
+
+# Where your bottles live. Default location is ~/Library/Application Support/...
+BOTTLE_DIRS="/Volumes/Storage/CrossOver/Bottles:$HOME/Library/Application Support/CrossOver/Bottles"
+
+MARK='# --- native NVK (managed by nvk-bottle.sh) ---'
+
+die() { echo "error: $*" >&2; exit 1; }
+
+find_bottle() {
+  _b=$1
+  IFS=:
+  for d in $BOTTLE_DIRS; do
+    [ -d "$d/$_b" ] && { unset IFS; printf '%s' "$d/$_b"; return 0; }
+  done
+  unset IFS
+  die "bottle '$_b' not found under: $BOTTLE_DIRS"
+}
+
+env_block() {
+  # $1 = want d3d12 (yes/no), $2 = want dyld (yes/no)
+  printf '%s\n' "$MARK"
+  if [ "$1" = yes ]; then
+    printf '"WINEDLLOVERRIDES" = "d3d11,dxgi,d3d12,d3d12core=n"\n'
+  else
+    printf '"WINEDLLOVERRIDES" = "d3d11,dxgi=n"\n'
+  fi
+  printf '"DXVK_CONFIG" = "dxvk.enableDescriptorBuffer = False"\n'
+  printf '"DXVK_HUD" = "devinfo,fps,frametimes"\n'
+  printf '"DXVK_LOG_LEVEL" = "info"\n'
+  printf '"WINEMSYNC" = "1"\n'
+  [ "$2" = yes ] && printf '"DYLD_LIBRARY_PATH" = "%s/lib"\n' "$RUNTIME"
+  printf '%s\n' "$MARK"
+}
+
+strip_block() {   # remove a previously written block from stdin
+  awk -v m="$MARK" 'index($0,m){s=!s; next} !s'
+}
+
+cmd_setup() {
+  bottle=$1; shift
+  want12=no; wantdyld=no
+  for a in "$@"; do
+    case $a in --d3d12) want12=yes ;; --dyld) wantdyld=yes ;; *) die "unknown flag $a" ;; esac
+  done
+  prefix=$(find_bottle "$bottle")
+  conf="$prefix/cxbottle.conf"
+  [ -f "$conf" ] || die "no cxbottle.conf in $prefix"
+  pgrep -q wineserver && die "wineserver running - 'Quit All Applications' on the bottle first"
+
+  echo "prefix: $prefix"
+  "$RUNTIME/bin/nvk-runtime" check "$RUNTIME"
+  "$RUNTIME/bin/nvk-runtime" install "$RUNTIME" "$prefix" \
+    || echo "  (non-zero is expected if already installed)"
+  if [ "$want12" = yes ]; then
+    "$RUNTIME/bin/nvk-runtime" install-d3d12 "$RUNTIME" "$prefix" \
+      || echo "  (non-zero is expected if already installed)"
+  fi
+
+  [ -f "$conf.bak" ] || cp "$conf" "$conf.bak"
+  tmp=$(mktemp)
+  strip_block < "$conf" > "$tmp"
+  # drop CX_GRAPHICS_BACKEND: it makes CrossOver pick its own D3D path
+  grep -v 'CX_GRAPHICS_BACKEND' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"
+  grep -q '^\[EnvironmentVariables\]' "$tmp" || printf '\n[EnvironmentVariables]\n' >> "$tmp"
+  env_block "$want12" "$wantdyld" >> "$tmp"
+  mv "$tmp" "$conf"
+
+  "$CXW" --bottle "$bottle" --cx-app reg add 'HKCU\Software\Wine\DllOverrides' \
+      /v d3d11 /t REG_SZ /d native /f >/dev/null 2>&1 || true
+  "$CXW" --bottle "$bottle" --cx-app reg add 'HKCU\Software\Wine\DllOverrides' \
+      /v dxgi  /t REG_SZ /d native /f >/dev/null 2>&1 || true
+
+  echo "setup complete (d3d12=$want12 dyld=$wantdyld). Backup: $conf.bak"
+  [ "$wantdyld" = yes ] && echo "You can now launch from CrossOver/Steam directly."
+}
+
+cmd_run() {
+  bottle=$1; app=$2; shift 2
+  prefix=$(find_bottle "$bottle")
+  [ -e "$prefix/drive_c/$(printf '%s' "$app" | tr '\\' '/')" ] \
+    || echo "warning: can't see that exe under drive_c - trying anyway"
+  export CX_ROOT WINEMSYNC=1
+  export PATH="$CX_ROOT/bin:$PATH"
+  mkdir -p "$prefix/drive_c/dxvk"
+  cd "$prefix/drive_c"
+  # shellcheck disable=SC2086
+  env WINEPREFIX="$prefix" \
+      DYLD_LIBRARY_PATH="$RUNTIME/lib" \
+      DXVK_LOG_PATH='C:\dxvk' \
+      "$CXW" --bottle "$bottle" --cx-app "$app" "$@"
+}
+
+cmd_status() {
+  prefix=$(find_bottle "$1")
+  echo "prefix: $prefix"
+  for f in d3d11 dxgi d3d12 d3d12core; do
+    p="$prefix/drive_c/windows/system32/$f.dll"
+    [ -e "$p" ] && printf '  %-10s %s\n' "$f.dll" "$(shasum -a 256 "$p" | cut -c1-16)"
+  done
+  echo "--- cxbottle.conf env ---"
+  sed -n '/\[EnvironmentVariables\]/,$p' "$prefix/cxbottle.conf"
+}
+
+cmd_undo() {
+  bottle=$1; prefix=$(find_bottle "$bottle")
+  "$RUNTIME/bin/nvk-runtime" restore "$RUNTIME" "$prefix" "$CXW" --bottle "$bottle" || true
+  [ -f "$prefix/cxbottle.conf.bak" ] && cp "$prefix/cxbottle.conf.bak" "$prefix/cxbottle.conf"
+  echo "restored."
+}
+
+case "${1:-}" in
+  setup)  shift; [ $# -ge 1 ] || die "usage: setup <bottle> [--d3d12] [--dyld]"; cmd_setup "$@" ;;
+  run)    shift; [ $# -ge 2 ] || die "usage: run <bottle> '<exe path under drive_c>' [args]"; cmd_run "$@" ;;
+  status) shift; [ $# -eq 1 ] || die "usage: status <bottle>"; cmd_status "$1" ;;
+  undo)   shift; [ $# -eq 1 ] || die "usage: undo <bottle>"; cmd_undo "$1" ;;
+  *) sed -n '2,20p' "$0"; exit 1 ;;
+esac

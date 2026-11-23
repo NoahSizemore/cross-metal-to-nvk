@@ -1,0 +1,19 @@
+# Local-only working material: the original handoff tarball and superseded
+# copies of the scripts. Never shipped, never committed.
+/.local/
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Generated launchers and logs never belong in the repo
+*.app/
+*.log

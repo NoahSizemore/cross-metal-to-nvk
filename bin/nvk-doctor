@@ -1,0 +1,52 @@
+#!/bin/sh
+# Report the current graphics configuration of the NVK/CrossOver setup.
+# Read-only -- changes nothing. Run any time: sh ~/Downloads/nvk-status.sh
+
+P=/Volumes/Storage/CrossOver/Bottles/Steam
+R=/Library/GPUBundles/nvmtl/wine
+UD="$P/drive_c/Program Files (x86)/Steam/userdata/892063861/1422450"
+G="$P/drive_c/Program Files (x86)/Steam/steamapps/common/Deadlock"
+
+echo "=============== cxbottle.conf [EnvironmentVariables] ==============="
+sed -n '/\[EnvironmentVariables\]/,$p' "$P/cxbottle.conf"
+echo
+echo "CX_GRAPHICS_BACKEND present? (want: no output = unset)"
+grep -c CX_GRAPHICS_BACKEND "$P/cxbottle.conf" | sed 's/^0$/  none - unset (OK)/'
+
+echo
+echo "=============== registry DLL overrides ==============="
+grep -nE '"(d3d11|dxgi|d3d12|vulkan-1)"' "$P/user.reg" || echo "  (no d3d11/dxgi entries found)"
+
+echo
+echo "=============== DXVK pair in system32 ==============="
+for f in d3d11 dxgi; do
+  h=$(shasum -a 256 "$P/drive_c/windows/system32/$f.dll" 2>/dev/null | cut -d' ' -f1)
+  case "$f:$h" in
+    d3d11:a9a01503d658adf9fad93f1768ff06bc2688acb855ef0e7e0153e761f90ea5f0)
+      echo "  d3d11.dll  OK  (runtime's repaired DXVK 3.1.1)" ;;
+    dxgi:cd0d57cb5ae8e29440cfabc185fe2446f24c1acca2ff238b4e994e69e7c913d4)
+      echo "  dxgi.dll   OK  (runtime's repaired DXVK 3.1.1)" ;;
+    *) echo "  $f.dll  MISMATCH -> $h"
+       echo "     re-run: $R/bin/nvk-runtime install $R $P" ;;
+  esac
+done
+
+echo
+echo "=============== launch args in the script ==============="
+grep -n "^game_args=" "$HOME/Downloads/deadlock-nvk.sh" 2>/dev/null || echo "  script not at ~/Downloads/deadlock-nvk.sh"
+
+echo
+echo "=============== video.txt ==============="
+if [ -f "$UD/local/cfg/video.txt" ]; then
+  grep -E 'VendorID|DeviceID|upscaling|viewportscale|knowndevice' "$UD/local/cfg/video.txt" \
+    || echo "  (present, none of the interesting keys)"
+else
+  echo "  absent - engine will profile fresh on next successful device creation (OK)"
+fi
+
+echo
+echo "=============== logs that would prove DXVK ran ==============="
+find "$P" -name '*d3d11.log' -o -name '*dxvk*.log' 2>/dev/null | head -5
+ls "$P/drive_c/dxvk/" 2>/dev/null | head -5
+echo "  console.log:"
+ls -l "$G/game/citadel/console.log" 2>/dev/null || echo "    none yet"
