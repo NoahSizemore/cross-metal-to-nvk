@@ -8,7 +8,8 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 . "$ROOT/tests/lib.sh"
 TEST_NAME=cli
 
-TOOLS='nvk-setup nvk-doctor nvk-bottle nvk-steam nvk-winepath nvk-profile nvk-mkapp'
+TOOLS='nvk-setup nvk-doctor nvk-bottle nvk-steam nvk-winepath nvk-profile nvk-mkapp
+nvk-flipstat nvk-mdmp nvk-icon'
 
 printf '%s\n' "$TEST_NAME"
 
@@ -28,6 +29,13 @@ for t in $TOOLS; do
 
   assert_rc "$t rejects an unknown flag" 1 sh -c "'$bin' --definitely-not-a-flag >/dev/null 2>&1 </dev/null"
 
+  # usage() prints the leading comment block. It used to take a hardcoded line
+  # range, which drifted every time a header grew or shrank: two tools ended up
+  # printing shell code after their comments, and two truncated their own
+  # option lists. Assert on the symptom so the range cannot drift again.
+  assert_eq "$t --help prints no shell code" "" \
+    "$(printf '%s\n' "$help" | grep -E '^(set -[eux]|emulate |setopt |[A-Za-z_][A-Za-z0-9_]*=)' || true)"
+
   # "Never require sudo" is design rule 2. Grepping for the word cannot test it
   # -- nvk-doctor legitimately prints sudo *advice* for the driver's failed-air
   # directory. Test the property instead: nothing may be setuid, and the whole
@@ -37,10 +45,15 @@ for t in $TOOLS; do
 done
 
 # The shebang each tool claims, since the zsh/sh split is a design rule.
-for t in nvk-doctor nvk-bottle nvk-steam nvk-winepath nvk-profile nvk-mkapp; do
+for t in nvk-doctor nvk-bottle nvk-steam nvk-winepath nvk-profile nvk-mkapp \
+         nvk-flipstat nvk-icon; do
   assert_eq "$t is POSIX sh" "#!/bin/sh" "$(head -1 "$ROOT/bin/$t")"
 done
 assert_eq "nvk-setup is the only zsh script" "#!/bin/zsh" "$(head -1 "$ROOT/bin/nvk-setup")"
+# nvk-mdmp parses a binary format with bit-exact struct offsets, which sh
+# cannot do. It is the one tool that is neither sh nor zsh.
+assert_eq "nvk-mdmp is python3" "#!/usr/bin/env python3" \
+  "$(head -1 "$ROOT/bin/nvk-mdmp")"
 
 # Design rule 2: the tools that change something refuse to run as root. The
 # read-only ones do not need to, and nvk-doctor deliberately only warns, since

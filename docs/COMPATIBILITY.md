@@ -2,7 +2,7 @@
 
 What works, what does not, and which failures are not this project's to fix.
 
-> Coverage is currently **one machine and one game**. Entries below marked
+> Coverage is currently **one machine and two games played**. Entries below marked
 > *verified* were observed directly; everything else is reasoning from the
 > architecture and should be treated as a prediction until someone reports
 > otherwise.
@@ -40,11 +40,89 @@ prints both rather than choosing between them.
 
 | Game | Engine | API | Status |
 |---|---|---|---|
-| Deadlock (1422450) | Source 2 | D3D11 | *Verified playable.* 35–130 fps, low settings, FSR2 2x. |
+| Deadlock (1422450) | Source 2 | D3D11 | *Verified playable.* **Ultra** preset, FSR2 2x, 1920×1080: ~88 frames/s presented, ~3.8 ms in light scenes, 40–43 fps in dense geometry. |
+| Counter-Strike 2 (730) | Source 2 | D3D11 | *Starts and renders.* Not benchmarked. |
+| Valheim (892970) | Unity | D3D11 | *Not run.* Ships EasyAntiCheat; see Anticheat below. |
+| Deadlock / CS2 with `-vulkan` | Source 2 | Vulkan | **Fails.** Swapchain creation refused; see below. |
 
-Deadlock also ships a Vulkan renderer (`rendersystemvulkan.dll`). Running it
-with `-vulkan` would drop DXVK from the chain entirely. **Untested** — a
-promising experiment for anyone with the stack working.
+Two levers matter, in this order.
+
+**Turn on the driver's experimental features** — they are off by default and
+they are the largest measured improvement:
+
+```sh
+sudo /Library/NullMoth/nullmoth-setup.sh --experimental gameprio,tile,tgp
+```
+
+`gameprio` alone cut frame-time spikes from 41 ms to 10–15 ms. See the README
+for what each does and why `icb` must be left off.
+
+**Then resolution.** 2560×1440 → 1920×1080 roughly doubled the frame-rate floor.
+Quality presets are effectively free on this stack, so lower the resolution
+before you lower the settings — Ultra costs nothing that low does not.
+
+### Native Vulkan (`-vulkan`) does not work
+
+Both Source 2 titles ship `rendersystemvulkan.dll`, and running them with
+`-vulkan` drops DXVK from the chain entirely. It is the right idea and it does
+not work: the engine aborts during presentation setup.
+
+```
+ERROR! VK call failed! result = Unknown VkResult value ( vkCreateSwapchainKHR(...) )
+Failed to initialize video!
+FATAL ERROR: AppSystemDict: Error in Init() of interface 'RenderDeviceMgr001'!
+```
+
+You will see a dock icon, nothing on screen, and exit status 1. Nothing is
+written to `console.log`, because the process aborts before log flushing.
+
+**If you want to retry this on your own machine** — worth doing, since it is one
+machine's result against an unqualified configuration — the flag goes in
+`--args`, not into Steam's launch options, which a generated launcher bypasses:
+
+```sh
+./bin/nvk-mkapp --profile profiles/deadlock-1422450.conf --args '-vulkan'
+```
+
+Then read the engine's own report out of the dump it leaves beside the
+executable:
+
+```sh
+./bin/nvk-mdmp '<game>/game/bin/win64/deadlock_<date>_<time>_0_error.mdmp'
+```
+
+Already ruled out on the reference machine, so you need not repeat it: the flag
+takes effect (`Render system: Vulkan`, real vendor ID `0x10de`); device creation
+succeeds; the renderer module and `shaders_vulkan_*.vpk` both ship in the
+Windows depot; `vulkan-1.dll` and `winevulkan.dll` both load; and forcing
+`-w 1920 -h 1080` changes nothing. The `0x80000003 BREAKPOINT` exception is the
+engine's deliberate abort, not a memory fault.
+
+Write-up in
+[upstream/04-native-vulkan-swapchain-creation-fails.md](upstream/04-native-vulkan-swapchain-creation-fails.md).
+Note that the runtime's README scopes support to "an x64 Windows D3D11 or D3D12
+game", so a game driving `VK_KHR_swapchain` itself was never qualified — this is
+an unsupported configuration failing, not a regression.
+
+### Deadlock requires Steam to be running already
+
+Deadlock **crashes on boot** if Steam is not already up, even with
+`needs_steam=yes` — which starts Steam, waits for a `wineserver` and a
+`steamwebhelper` for this prefix, then settles before launching. That is not
+sufficient for this title. Launching **Steam (NVK)** first, letting it come up,
+then launching the game works reliably.
+
+So the two-app split is not merely the documented preference here, it is
+required, and this is a concrete instance of the `--needs-steam` caveat below
+rather than a hypothetical one. It also constrains diagnostics: any test that
+calls for "Steam fully closed" cannot be run on Deadlock.
+
+### Renderer choice and Steam's launch-option prompt
+
+Some games ask which renderer to use through a prompt that Steam shows when you
+press Play. A generated `.app` launches the executable directly and therefore
+never sees that prompt. Pass the flag in `--args` instead. This is a property of
+the two-app split, not a bug, and it is easy to mistake for one.
 
 ---
 

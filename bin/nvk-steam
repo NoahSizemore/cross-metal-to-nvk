@@ -41,7 +41,7 @@ STEAM_ROOT=
 SHOW_ALL=no
 
 die() { printf 'nvk-steam: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
 
 # Forwarded as two real arguments, never as a string holding a flag: this
 # domain is full of paths with spaces in it -- CrossOver's own default bottle

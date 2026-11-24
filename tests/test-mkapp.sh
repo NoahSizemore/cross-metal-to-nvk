@@ -140,4 +140,37 @@ assert_rc "a missing --app is refused" 1 "$MK" --bottle-dir "$FIX" --bottle bott
   --runtime "$FIX/fake-runtime" --crossover "$CXA" --dry-run
 assert_rc "an unknown flag is refused" 1 "$MK" --nonsense
 
+# --env is delivered via CX_ENV, which CrossOver splits with shellwords. A value
+# containing whitespace would silently become two variables, and a malformed
+# pair would be dropped, so both are refused up front.
+assert_rc "--env needs KEY=VALUE" 1 "$MK" --env NOEQUALS
+assert_rc "--env rejects a bad key" 1 "$MK" --env 'a b=1'
+assert_rc "--env rejects whitespace in the value" 1 "$MK" --env 'K=a b'
+assert_rc "--env rejects a semicolon" 1 "$MK" --env 'K=a;b'
+# shellwords treats quotes and backslashes as syntax, so an unbalanced one
+# makes CrossOver drop the whole of CX_ENV rather than just that variable.
+# A profile remembers where its launcher was installed, so --regenerate-all can
+# put it back there. Without this, regenerating moved every launcher to the
+# default directory and left the original behind as a stale duplicate.
+pdir="$TMP/profiles"; odir="$TMP/elsewhere"
+mkdir -p "$pdir"
+mk --app 'C:\g.exe' --name outdirgame --outdir "$odir" \
+   --save-profile "$pdir/outdirgame.conf" >/dev/null 2>&1
+assert_eq "--outdir is recorded in the profile" "$odir" \
+  "$("$NP" read "$pdir/outdirgame.conf" outdir)"
+
+rm -rf "$odir"
+mk --profile "$pdir/outdirgame.conf" >/dev/null 2>&1
+assert_eq "the profile's outdir is used when no --outdir is given" "yes" \
+  "$([ -d "$odir/outdirgame.app" ] && echo yes || echo no)"
+
+other="$TMP/override"
+mk --profile "$pdir/outdirgame.conf" --outdir "$other" >/dev/null 2>&1
+assert_eq "an explicit --outdir still wins" "yes" \
+  "$([ -d "$other/outdirgame.app" ] && echo yes || echo no)"
+
+assert_rc "--env rejects a single quote" 1 "$MK" --env "K=it's"
+assert_rc "--env rejects a double quote" 1 "$MK" --env 'K=a"b'
+assert_rc "--env rejects a backslash" 1 "$MK" --env 'K=a\b'
+
 finish

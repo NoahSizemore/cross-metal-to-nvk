@@ -44,6 +44,39 @@ render target read and write for the whole frame. On the reference machine this
 is the largest single identified contributor to the gap between this stack and
 the same card on Windows.
 
+### Measured evidence that this machine is bandwidth-bound, not compute-bound
+
+Added after profiling Deadlock with `DXVK_HUD=gpuload,drawcalls,descriptors`:
+
+* **`gpuload` sits at ~100% essentially all the time**, with only rare brief
+  dips.
+* **Raising the quality preset from low to Ultra (with FSR2 2x) costs
+  nothing** — identical upper and lower frame-rate bounds.
+* **Frame cost scales with draw count, not shader complexity.** `drawcalls` more
+  than doubles on detailed views, and frame time roughly doubles with it
+  (~9 ms → ~20 ms), while shader quality changes are free.
+
+A GPU pinned at 100% whose ALUs are evidently idle — Ultra shading being free
+proves spare arithmetic capacity — is saturated by something other than
+arithmetic.
+
+**However, this machine turned out not to be pixel-sensitive, which argues
+against compression being the dominant cost.** Reducing render resolution
+produced no measurable change, and every available upscaler setting performed
+identically. Compression savings scale with render-target pixel traffic, so a
+workload indifferent to pixel count is unlikely to be limited primarily by
+compressed-vs-uncompressed render targets. What the measurements actually point
+at is a per-draw cost (see
+[05-descriptor-buffer-unavailable.md](05-descriptor-buffer-unavailable.md)).
+
+This is recorded because an earlier revision of this report claimed the
+`gpuload` reading corroborated compression as the leading bottleneck. It does
+not. The bug stands on its own terms — it fires on every render target
+allocation, 88 times in one 137-line session log — and it is a real,
+universally-applied tax. Its *rank* among this stack's costs is simply not
+established, and the resolution evidence suggests it is lower than first
+assumed.
+
 ## What would help
 
 The refusal reports `pte_kind` values `0xb` and `0xc` as unsupported, and

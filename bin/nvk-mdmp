@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Read a Windows minidump without a Windows debugger.
+
+Games that abort through an engine fatal-error path write their own diagnostic
+into the dump rather than to a log file, because the process dies before log
+flushing. That report is the useful artefact, and on macOS nothing reads it.
+
+Prints the exception record, the loaded graphics modules, and any embedded
+comment stream. Read-only; never needs sudo.
+"""
+
+import argparse
+import struct
+import sys
+
+STREAM_MODULE_LIST = 4
+STREAM_EXCEPTION = 6
+STREAM_COMMENT_A = 10
+STREAM_COMMENT_W = 11
+
+MODULE_ENTRY_SIZE = 108
+
+EXC_NAMES = {
+    0x80000003: "BREAKPOINT",
+    0xC0000005: "ACCESS_VIOLATION",
+    0xC000001D: "ILLEGAL_INSTRUCTION",
+    0xC0000025: "NONCONTINUABLE_EXCEPTION",
+    0xC0000094: "INTEGER_DIVIDE_BY_ZERO",
+    0xC0000096: "PRIVILEGED_INSTRUCTION",
+    0xC00000FD: "STACK_OVERFLOW",
+    0xC0000374: "HEAP_CORRUPTION",
+    0xE06D7363: "CPP_EH_EXCEPTION",
+}
+
+# A BREAKPOINT reaching a crash handler is an engine abort, not a memory fault.
+# Saying so inline saves the next reader an hour.
+EXC_HINTS = {
+    0x80000003: "deliberate abort via a fatal-error path, not a memory fault",
+}
+
+GFX_KEYS = (
+    "rendersystem", "vulkan", "d3d11", "d3d12", "d3d9", "dxgi", "nvk",
+    "vfx_", "nvapi", "dxvk", "winevulkan", "vkd3d", "opengl", "metal",
+)
+
+
+def utf16_at(buf, off):
+    (n,) = struct.unpack_from("<I", buf, off)
+    return buf[off + 4 : off + 4 + n].decode("utf-16-le", "replace")
+
+
+def leaf(path):
+    return path.replace("/", "\\").rsplit("\\", 1)[-1]
+
+
+def read_streams(buf):
+    magic, _ver, count, diroff = struct.unpack_from("<4sIII", buf, 0)
+    if magic != b"MDMP":
+        sys.exit(f"not a minidump (magic {magic!r})")
+    streams = {}
+    for i in range(count):
+        stype, size, loc = struct.unpack_from("<III", buf, diroff + i * 12)
+        streams[stype] = (size, loc)
+    return streams
+
+
+def read_modules(buf, streams):
+    if STREAM_MODULE_LIST not in streams:
+        return []
+    _, loc = streams[STREAM_MODULE_LIST]
+    (count,) = struct.unpack_from("<I", buf, loc)
+    out = []
+    for i in range(count):
+        base = loc + 4 + i * MODULE_ENTRY_SIZE
+        addr, size, _chk, _ts, nameptr = struct.unpack_from("<QIIII", buf, base)
+        out.append((addr, size, utf16_at(buf, nameptr)))
+    out.sort()
+    return out
+
+
+def owning_module(modules, addr):
+    for base, size, name in modules:
+        if base <= addr < base + size:
+            return f"{leaf(name)} (+0x{addr - base:x})"
+    return "<not in any loaded module>"
+
+
+def print_exception(buf, streams, modules):
+    if STREAM_EXCEPTION not in streams:
+        print("no exception stream")
+        return
+    _, loc = streams[STREAM_EXCEPTION]
+    (tid,) = struct.unpack_from("<I", buf, loc)
+    # MINIDUMP_EXCEPTION begins at +8; ExceptionAddress at +24, NumberParameters at +32.
+    code, flags = struct.unpack_from("<II", buf, loc + 8)
+    (exc_addr,) = struct.unpack_from("<Q", buf, loc + 24)
+    (nparams,) = struct.unpack_from("<I", buf, loc + 32)
+    params = struct.unpack_from("<15Q", buf, loc + 40)
+
+    print("exception")
+    print(f"  thread    {tid}")
+    name = EXC_NAMES.get(code, "UNKNOWN")
+    print(f"  code      0x{code:08X}  {name}")
+    hint = EXC_HINTS.get(code)
+    if hint:
+        print(f"            -> {hint}")
+    print(f"  flags     0x{flags:08X}")
+    print(f"  address   0x{exc_addr:016X}")
+    print(f"  module    {owning_module(modules, exc_addr)}")
+    if 0 < nparams <= 15:
+        print(f"  params    {[hex(p) for p in params[:nparams]]}")
+
+
+def print_modules(modules, show_all):
+    print("\nmodules" if show_all else "\ngraphics modules")
+    shown = 0
+    for base, size, name in modules:
+        nm = leaf(name)
+        if show_all or any(k in nm.lower() for k in GFX_KEYS):
+            print(f"  0x{base:012X} +0x{size:08X}  {nm}")
+            shown += 1
+    if not shown:
+        print("  (none matched)")
+
+
+def print_comment(buf, streams):
+    for stype in (STREAM_COMMENT_A, STREAM_COMMENT_W):
+        if stype not in streams:
+            continue
+        size, loc = streams[stype]
+        blob = buf[loc : loc + size]
+        text = (
+            blob.decode("utf-16-le", "replace")
+            if stype == STREAM_COMMENT_W
+            else blob.decode("latin-1", "replace")
+        )
+        text = text.replace("\x00", "").strip()
+        if text:
+            print("\nengine report (comment stream)")
+            print("-" * 68)
+            print(text)
+            print("-" * 68)
+            return
+    print("\nno comment stream (no engine report embedded)")
+
+
+class Parser(argparse.ArgumentParser):
+    """Exit 1 on a usage error, not argparse's 2, to match the other tools."""
+
+    def error(self, message):
+        self.exit(1, f"{self.prog}: {message}\n")
+
+
+def main():
+    ap = Parser(
+        prog="nvk-mdmp",
+        description="Read a Windows minidump: exception, modules, engine report.",
+        epilog=(
+            "Games that abort through an engine fatal-error path write their "
+            "diagnostic into the dump rather than to a log file, because the "
+            "process dies before log flushing. Source 2 puts it in the comment "
+            "stream. Dumps are left beside the game executable as "
+            "<name>_<date>_<time>_0_error.mdmp. Exit: 0 success, 1 error."
+        ),
+    )
+    ap.add_argument("dump", help="path to a .mdmp file")
+    ap.add_argument(
+        "--all-modules",
+        action="store_true",
+        help="list every loaded module, not just graphics ones",
+    )
+    ap.add_argument(
+        "--report-only",
+        action="store_true",
+        help="print only the engine's embedded report",
+    )
+    args = ap.parse_args()
+
+    try:
+        with open(args.dump, "rb") as fh:
+            buf = fh.read()
+    except OSError as exc:
+        sys.exit(f"cannot read {args.dump}: {exc}")
+
+    streams = read_streams(buf)
+    modules = read_modules(buf, streams)
+
+    if args.report_only:
+        print_comment(buf, streams)
+        return
+
+    print(f"dump      {args.dump}")
+    print(f"modules   {len(modules)} loaded")
+    print()
+    print_exception(buf, streams, modules)
+    print_modules(modules, args.all_modules)
+    print_comment(buf, streams)
+
+
+if __name__ == "__main__":
+    main()

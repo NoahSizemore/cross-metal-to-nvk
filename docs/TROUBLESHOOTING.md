@@ -73,6 +73,52 @@ device is the one on the `Found device:` line.
 
 ---
 
+## Nothing launches: "Abort trap: 6", exit status 134
+
+**Symptom:** every app in the bottle fails immediately, Steam included, and the
+log shows `dyld` refusing to start the process:
+
+```
+dyld[NNNNN]: terminating because inserted dylib '/tmp/hook.dylib' could not be
+loaded: tried: ... (no such file)
+launch: line NN: NNNNN Abort trap: 6   env WINEPREFIX=... "$CXW" --bottle ...
+exited rc=134
+```
+
+**Cause:** something has added a `DYLD_INSERT_LIBRARIES` assignment to
+CrossOver's own `wine` script, pointing at a file under `/tmp`. Since `/tmp` is
+wiped on reboot, this works until the first restart and then breaks every
+launch. 134 is 128 + 6, i.e. `SIGABRT` — `dyld` aborts before Wine starts, so
+nothing in this project's logs explains it.
+
+**Check** whether CrossOver's `wine` has been modified. Stock CrossOver does not
+insert dylibs:
+
+```sh
+W=/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine
+grep -n 'DYLD_INSERT_LIBRARIES' "$W"
+ls -la@ "$(dirname "$W")" | head
+```
+
+`wine` carrying a different modification date from its siblings — and having
+lost the extended attributes they still show — means it was rewritten rather
+than shipped that way.
+
+**Fix:** back it up and comment the assignment out.
+
+```sh
+cp -p "$W" "$W.bak"
+# then comment out the `if ($cmd =~ /wineloader/) { ... }` block around it
+perl -c "$W"     # must print "syntax OK"
+```
+
+Reinstalling CrossOver also restores the stock script.
+
+This is not part of the NullMoth driver integration — its scripts do not
+reference `hook.dylib` — so removing the injection does not affect NVK.
+
+---
+
 ## No DXVK log appears at all
 
 **Cause:** `DXVK_LOG_PATH` was given a unix path. It must be a **Windows** path
@@ -104,15 +150,30 @@ repo's control; it needs a driver fix.
 
 ## Poor frame rate
 
-Expected, to a degree — see the README's Performance section. Before
-investigating further, confirm:
+Expected, to a degree — see the README's Performance section. In order:
 
-* `WINEMSYNC=1` is set. On the reference machine, enabling it moved a comparison
-  from 41–50 fps to 60–74 fps.
-* You are not running at a higher output resolution than you need. Presentation
-  costs one full-frame GPU copy per present, so resolution is a direct lever.
+* **Turn on the driver's experimental features.** They ship off, they are the
+  largest measured improvement, and almost nobody knows they exist:
+  ```sh
+  sudo /Library/NullMoth/nullmoth-setup.sh --experimental gameprio,tile,tgp
+  ```
+  `gameprio` alone took frame-time spikes from 41 ms to 10–15 ms. `tgp` needs a
+  reboot. Do **not** add `icb` — it drives GPU utilisation up while making both
+  frame time and frame rate worse.
+* **Do not lower quality settings first.** They are effectively free on this
+  stack — Ultra measured the same as Low. Lower the *resolution* instead, which
+  is a real lever.
+* `WINEMSYNC=1` is set. `nvk-bottle` writes it, but a bottle configured by an
+  older version may not have it; check with `nvk-bottle status <bottle>` rather
+  than grepping, since it is easy to miss.
 * Framebuffer compression is refused on every target (DRIVER-ISSUES §3). Nothing
   you can configure changes this today.
+
+**Measure with `nvk-flipstat`, not with an FPS overlay.** The overlay counts
+frames the renderer produced; on the reference machine it reported 195–240 fps
+during sessions that actually presented 61–88. Note also that gameplay
+run-to-run variance reaches 35%, so compare a fixed viewpoint before and after
+a change rather than two whole sessions.
 
 ---
 

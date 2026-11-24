@@ -67,7 +67,7 @@ typeset allow_anticheat=no
 typeset args_given=no
 
 die()  { print -r -- "nvk-setup: $*" >&2; exit 1 }
-usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//' }
+usage() { sed -n '2,/^[^#]/p' "$SELF" | sed '$d; s/^# \{0,1\}//' }
 
 while (( $# )); do
   case $1 in

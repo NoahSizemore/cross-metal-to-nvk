@@ -39,7 +39,7 @@ nvk_bottle() {
 }
 
 die() { printf 'nvk-winepath: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
 
 # A bottle name or a prefix path, resolved to a prefix path.
 resolve_prefix() {

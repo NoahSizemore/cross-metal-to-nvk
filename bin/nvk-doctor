@@ -44,7 +44,7 @@ DO_SUMS=yes
 QUIET=no
 COLOR=auto
 
-usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
 die()   { printf 'nvk-doctor: %s\n' "$*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do

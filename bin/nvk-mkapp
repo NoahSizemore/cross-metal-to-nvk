@@ -25,6 +25,11 @@
 #   --no-needs-steam     do not (the default)
 #   --steam-app PATH     Windows path to steam.exe
 #   --dxvk-config TEXT   DXVK_CONFIG for this game
+#   --env KEY=VALUE      a variable the launcher exports; repeatable. This is
+#                        where NVK_*/NVRM_* knobs belong -- they are read by
+#                        native code via getenv(), and cxbottle.conf only
+#                        reaches Windows-side code such as DXVK. Launcher
+#                        exports reach both, so DXVK_* works here too.
 #   --icon-from PATH     an .app or directory to lift an .icns from
 #   --outdir DIR         where to put the .app (default ~/Applications)
 #   --bottle-dir PATH    look for the bottle here too
@@ -55,13 +60,14 @@ SQ="'"
 RUNTIME=${NVK_RUNTIME:-/Library/GPUBundles/nvmtl/wine}
 CX_APP=${NVK_CROSSOVER:-/Applications/CrossOver.app}
 OUTDIR="$HOME/Applications"
+OUTDIR_SET=no
 PROFILE_DIR=
 EXTRA_DIR=
 DRY_RUN=no
 
 die() { printf 'nvk-mkapp: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'nvk-mkapp: %s\n' "$*" >&2; }
-usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
 
 [ "$(id -u)" = 0 ] && die "do not run this as root"
 
@@ -71,6 +77,45 @@ usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; }
 shq() {
   _v=$(printf '%s' "$1" | sed "s/$SQ/$SQ\\\\$SQ$SQ/g")
   printf '%s%s%s' "$SQ" "$_v" "$SQ"
+}
+
+# Accumulate a --env KEY=VALUE pair into f_env, semicolon-separated so the whole
+# set fits one profile line.
+#
+# These are delivered through CX_ENV, which is the only channel that works.
+# Two routes were tried and measured first:
+#
+#   cxbottle.conf [EnvironmentVariables] -- reaches Windows-side code such as
+#     DXVK, but not native code. NVK_CMDMEM_RECYCLE=1 set there, and the
+#     runtime still logged "recycler off (NVK_CMDMEM_RECYCLE=0)".
+#   a plain export in this launcher -- also ignored, for the same observed
+#     result, because CrossOver's wine is a Perl script that rebuilds the
+#     environment rather than inheriting arbitrary names.
+#
+# That script reads CX_ENV (its own --env flag does the same thing) and splits
+# it with shellwords into %ENV before launching, so the values land in the Unix
+# environment the game and its native dylibs actually see.
+#
+# shellwords splits on whitespace, so a value containing a space would become
+# two variables. Refuse those rather than emit something that silently misparses.
+add_env() {
+  case $1 in
+    *=*) ;;
+    *) die "--env expects KEY=VALUE, got '$1'" ;;
+  esac
+  _k=${1%%=*}
+  case $_k in
+    '' | *[!A-Za-z0-9_]* ) die "--env key must be alphanumeric/underscore: '$_k'" ;;
+  esac
+  case $1 in
+    *';'* ) die "--env may not contain a semicolon: '$1'" ;;
+    *[\ \	]* ) die "--env may not contain whitespace (CX_ENV is split on it): '$1'" ;;
+    # shellwords also treats quotes and backslashes as syntax. An unbalanced
+    # one makes CrossOver fail to parse CX_ENV and drop the whole set, which
+    # would look like the variable silently not arriving.
+    *\'* | *\"* | *\\* ) die "--env may not contain a quote or backslash: '$1'" ;;
+  esac
+  f_env="${f_env:+$f_env;}$1"
 }
 
 # A launcher is double-clicked from Finder, where the working directory is
@@ -91,9 +136,9 @@ xmlesc() {
 # ------------------------------------------------------------- settings ----
 # Empty means "not given". Flags are applied after the profile so they win.
 
-p_bottle=; p_app=; p_name=; p_args=; p_needs=; p_steamapp=; p_icon=; p_dxvk=
+p_bottle=; p_app=; p_name=; p_args=; p_needs=; p_steamapp=; p_icon=; p_dxvk=; p_env=; p_outdir=
 p_appid=; p_gamename=; p_installdir=; p_anticheat=; p_notes=; p_exeunix=; p_bottledir=
-f_bottle=; f_app=; f_name=; f_args=; f_needs=; f_steamapp=; f_icon=; f_dxvk=
+f_bottle=; f_app=; f_name=; f_args=; f_needs=; f_steamapp=; f_icon=; f_dxvk=; f_env=
 f_args_given=no; f_arglist=; f_arglist_plain=
 PROFILE=; SAVE_PROFILE=; REGEN_ALL=no
 
@@ -113,7 +158,9 @@ load_profile() {
   p_needs=$("$HERE/nvk-profile" read "$f" needs_steam)
   p_steamapp=$("$HERE/nvk-profile" read "$f" steam_app)
   p_icon=$("$HERE/nvk-profile" read "$f" icon_from)
+  p_outdir=$("$HERE/nvk-profile" read "$f" outdir)
   p_dxvk=$("$HERE/nvk-profile" read "$f" dxvk_config)
+  p_env=$("$HERE/nvk-profile" read "$f" env)
   p_appid=$("$HERE/nvk-profile" read "$f" appid)
   p_gamename=$("$HERE/nvk-profile" read "$f" name)
   p_installdir=$("$HERE/nvk-profile" read "$f" installdir)
@@ -154,12 +201,15 @@ while [ $# -gt 0 ]; do
     --steam-app=*)    f_steamapp=${1#*=}; shift ;;
     --dxvk-config)    [ $# -ge 2 ] || die "--dxvk-config needs a value"; f_dxvk=$2; shift 2 ;;
     --dxvk-config=*)  f_dxvk=${1#*=}; shift ;;
+    --env)            [ $# -ge 2 ] || die "--env needs KEY=VALUE"; add_env "$2"; shift 2 ;;
+    --env=*)          add_env "${1#*=}"; shift ;;
     --icon-from)      [ $# -ge 2 ] || die "--icon-from needs a path"; f_icon=$2; shift 2 ;;
     --icon-from=*)    f_icon=${1#*=}; shift ;;
     --bottle-dir)     [ $# -ge 2 ] || die "--bottle-dir needs a path"; EXTRA_DIR=$2; shift 2 ;;
     --bottle-dir=*)   EXTRA_DIR=${1#*=}; shift ;;
-    --outdir)         [ $# -ge 2 ] || die "--outdir needs a path"; OUTDIR=$2; shift 2 ;;
-    --outdir=*)       OUTDIR=${1#*=}; shift ;;
+    --outdir)         [ $# -ge 2 ] || die "--outdir needs a path"
+                      OUTDIR=$2; OUTDIR_SET=yes; shift 2 ;;
+    --outdir=*)       OUTDIR=${1#*=}; OUTDIR_SET=yes; shift ;;
     --runtime)        [ $# -ge 2 ] || die "--runtime needs a path"; RUNTIME=$2; shift 2 ;;
     --runtime=*)      RUNTIME=${1#*=}; shift ;;
     --crossover)      [ $# -ge 2 ] || die "--crossover needs a path"; CX_APP=$2; shift 2 ;;
@@ -183,7 +233,12 @@ if [ "$REGEN_ALL" = yes ]; then
     printf '=== %s\n' "$f"
     if [ "$DRY_RUN" = yes ]; then dry=--dry-run; else dry=; fi
     # shellcheck disable=SC2086
-    if "$0" --profile "$f" --outdir "$OUTDIR" --runtime "$RUNTIME" --crossover "$CX_APP" \
+    # Forward --outdir only when the caller actually gave one, so each profile
+    # can keep its own: otherwise regenerating would move every launcher to
+    # this invocation's default.
+    if [ "$OUTDIR_SET" = yes ]; then odir="--outdir"; else odir=; fi
+    if "$0" --profile "$f" ${odir:+"$odir"} ${odir:+"$OUTDIR"} \
+            --runtime "$RUNTIME" --crossover "$CX_APP" \
             ${EXTRA_DIR:+--bottle-dir} ${EXTRA_DIR:+"$EXTRA_DIR"} $dry
     then :; else
       failed=$((failed + 1)); warn "failed: $f"
@@ -204,7 +259,10 @@ app=${f_app:-$p_app}
 needs_steam=${f_needs:-${p_needs:-no}}
 steam_app=${f_steamapp:-$p_steamapp}
 icon_from=${f_icon:-$p_icon}
+# A profile remembers where its launcher was installed; an explicit --outdir wins.
+[ "$OUTDIR_SET" = no ] && [ -n "$p_outdir" ] && OUTDIR=$p_outdir
 dxvk_config=${f_dxvk:-$p_dxvk}
+native_env=${f_env:-$p_env}
 
 [ -n "$bottle" ] || die "--bottle is required (or a profile that sets it)"
 [ -n "$app" ]    || die "--app is required (or a profile that sets it)"
@@ -258,6 +316,23 @@ slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}
 # ------------------------------------------------------- the launcher ------
 # Written to a variable first so --dry-run can show exactly what would run.
 
+# Turn the profile's semicolon-separated env list into one CX_ENV assignment.
+# See add_env for why CX_ENV rather than a plain export or cxbottle.conf.
+native_env_exports=
+if [ -n "$native_env" ]; then
+  _cxenv=
+  _rest=$native_env
+  while [ -n "$_rest" ]; do
+    case $_rest in
+      *\;*) _pair=${_rest%%\;*}; _rest=${_rest#*\;} ;;
+      *)    _pair=$_rest; _rest= ;;
+    esac
+    [ -n "$_pair" ] || continue
+    _cxenv="${_cxenv:+$_cxenv }$_pair"
+  done
+  [ -n "$_cxenv" ] && native_env_exports="export CX_ENV=$(shq "$_cxenv")"
+fi
+
 launcher=$(cat <<LAUNCH
 #!/bin/sh
 # Generated by nvk-mkapp. Do not edit: regenerate from the profile instead.
@@ -286,6 +361,7 @@ CX_BOTTLE_PATH=\$(/usr/bin/dirname "\$PREFIX")
 export PATH CX_ROOT CX_BOTTLE_PATH
 export WINEMSYNC=1
 [ -n "\$DXVK_CONFIG_VALUE" ] && export DXVK_CONFIG="\$DXVK_CONFIG_VALUE"
+$native_env_exports
 
 mkdir -p "\$HOME/Library/Logs" "\$PREFIX/drive_c/dxvk"
 : > "\$LOG"
@@ -370,14 +446,40 @@ rm -rf "$bundle"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources" || die "cannot create $bundle"
 
 icon_line=
+icon_set() { icon_line='  <key>CFBundleIconFile</key><string>app</string>'; }
+
 if [ -n "$icon_from" ]; then
   src=$(find "$icon_from" -name '*.icns' 2>/dev/null | head -1)
   if [ -n "$src" ]; then
-    cp "$src" "$bundle/Contents/Resources/app.icns" && \
-      icon_line='  <key>CFBundleIconFile</key><string>app</string>'
+    cp "$src" "$bundle/Contents/Resources/app.icns" && icon_set
     printf 'icon:    %s\n' "$src"
   else
     warn "no .icns under $icon_from; using the default icon"
+  fi
+elif [ -x "$HERE/nvk-icon" ]; then
+  # No icon named, so look for one. nvk-icon prefers the .icns CrossOver
+  # extracted from the real executable and falls back to Steam's library
+  # artwork. Failure is not an error: a launcher without an icon still works.
+  #
+  # Match on the *game's* name, not the launcher's -- CrossOver's bundle is
+  # "Deadlock.app", while this launcher is "Deadlock (NVK)".
+  icon_name=$p_gamename
+  [ -n "$icon_name" ] || icon_name=$(printf '%s' "$name" | sed 's/ *(NVK) *$//')
+  # Point nvk-steam at the directory this bottle was actually resolved in --
+  # a profile can name a bottle dir that is not one of CrossOver's defaults,
+  # and $prefix already reflects whichever source won.
+  steam_root=$("$HERE/nvk-steam" root "$bottle" \
+                 --bottle-dir "$(dirname "$prefix")" 2>/dev/null)
+  # Empty --appid / --steam-root are accepted, so pass them unconditionally
+  # rather than building an argument list.
+  found=$("$HERE/nvk-icon" find --bottle "$bottle" \
+            --bottle-dir "$(dirname "$prefix")" --name "$icon_name" \
+            --crossover "$CX_APP" --appid "${p_appid:-}" \
+            --steam-root "${steam_root:-}" 2>/dev/null)
+  if [ -n "$found" ] &&
+     "$HERE/nvk-icon" make "$found" "$bundle/Contents/Resources/app.icns" >/dev/null 2>&1; then
+    icon_set
+    printf 'icon:    %s\n' "$found"
   fi
 fi
 
@@ -422,8 +524,10 @@ if [ -n "$SAVE_PROFILE" ]; then
   [ -n "$p_anticheat" ]  && set -- "$@" "anticheat=$p_anticheat"
   [ -n "$p_notes" ]      && set -- "$@" "notes=$p_notes"
   [ -n "$dxvk_config" ]  && set -- "$@" "dxvk_config=$dxvk_config"
+  [ -n "$native_env" ]   && set -- "$@" "env=$native_env"
   [ -n "$steam_app" ]    && set -- "$@" "steam_app=$steam_app"
   [ -n "$icon_from" ]    && set -- "$@" "icon_from=$icon_from"
+  set -- "$@" "outdir=$OUTDIR"
   "$HERE/nvk-profile" write "$SAVE_PROFILE" "$@" >/dev/null || die "could not write $SAVE_PROFILE"
   printf 'profile: %s\n' "$SAVE_PROFILE"
 fi

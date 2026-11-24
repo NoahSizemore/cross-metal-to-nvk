@@ -61,6 +61,18 @@ assert_rc "a missing file is an error" 1 "$NB" clean-conf /no/such/file.conf
 assert_rc "an unknown subcommand is an error" 1 "$NB" not-a-command
 assert_rc "path on an unknown bottle fails" 1 "$NB" path no-such-bottle-xyz
 
+# setup parses its flags before resolving the bottle, so these are reachable
+# without a real bottle or runtime.
+assert_rc "--log-level needs a value" 1 "$NB" setup any-bottle --log-level
+assert_rc "an unknown setup flag is an error" 1 "$NB" setup any-bottle --not-a-flag
+
+# --env writes straight into cxbottle.conf inside double quotes, so a value
+# carrying a quote or backslash would corrupt the file.
+assert_rc "--env needs KEY=VALUE" 1 "$NB" setup any-bottle --env NOEQUALS
+assert_rc "--env rejects a bad key" 1 "$NB" setup any-bottle --env 'a b=1'
+assert_rc "--env rejects a quote in the value" 1 "$NB" setup any-bottle --env 'K=a"b'
+assert_rc "--env rejects a backslash in the value" 1 "$NB" setup any-bottle --env 'K=a\b'
+
 # dirs must not invent directories that do not exist. Bottle directories
 # routinely contain spaces, so iterate on newlines, never on whitespace.
 _bad=

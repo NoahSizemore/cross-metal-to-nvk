@@ -1,0 +1,245 @@
+#!/bin/sh
+# nvk-flipstat -- read the driver's presentation counters, and delta them
+# around a game session.
+#
+# The kext exposes monotonic flip counters but no clock, pstate or frequency
+# reading, so presentation cost is the one part of the performance gap that can
+# be measured directly on this stack rather than inferred.
+#
+# Read-only. Never needs sudo.
+
+set -eu
+
+me=${0##*/}
+
+# macOS awk ignores printf's apostrophe flag, so group digits by hand.
+AWK_COMMA='
+function comma(x,   s, out, neg) {
+	s = sprintf("%d", x)
+	neg = (substr(s, 1, 1) == "-")
+	if (neg) s = substr(s, 2)
+	while (length(s) > 3) {
+		out = "," substr(s, length(s) - 2) out
+		s = substr(s, 1, length(s) - 3)
+	}
+	out = s out
+	return neg ? "-" out : out
+}
+'
+
+# Monotonic totals: meaningful as a delta.
+COUNTERS='
+debug.nvrmfb_flip_n
+debug.nvrmfb_flip_us_sum
+debug.nvrmfb_flip_latch_waits
+debug.nvrmfb_flip_latch_late
+debug.nvrmfb_flip_latch_deferred
+debug.nvrmfb_flip_latch_timeouts
+debug.nvrmfb_vram_grants
+debug.nvrmfb_vram_grant_bytes
+debug.nvrmfb_vram_releases
+debug.nvrmfb_vram_release_bytes
+debug.nvrm_isr_count
+debug.nvrm_isr_handled
+debug.nvrm_evt_posts
+debug.nvrm_evt_waits
+debug.nvrm_pm_waited
+'
+
+# High-water marks and current settings: report as-is, a delta would mislead.
+GAUGES='
+debug.nvrmfb_flip_us_max
+debug.nvrmfb_flip_latch_max_us
+debug.nvrmfb_flip_interval
+debug.nvrmfb_flip_latch
+debug.nvrmfb_flip_lean
+debug.nvrmfb_vram_mapped_bytes
+debug.nvrmfb_vram_budget_bytes
+debug.nvrmfb_vram_display_bytes
+'
+
+snapfile=${NVK_FLIPSTAT_SNAPSHOT:-${TMPDIR:-/tmp}/nvk-flipstat-$(id -u).snap}
+
+usage() {
+	cat <<EOF
+usage: $me <command>
+
+  show              print the counters now, with derived averages
+  begin             snapshot the counters before a session
+  end               print the delta since begin, then keep the snapshot
+  reset             discard the snapshot
+  keys              list the sysctls read
+
+  -h, --help        this text
+
+Snapshot file: $snapfile
+Override with NVK_FLIPSTAT_SNAPSHOT to keep several in parallel.
+
+Typical use:
+
+  $me begin
+  # ...play for a few minutes, then quit the game...
+  $me end
+
+Only the delta is meaningful. The raw totals accumulate from boot and include
+desktop compositing, so they say nothing about a single session.
+
+Mean flip rate is the figure to compare across runs: it counts frames that
+reached the display, unlike a renderer-side FPS overlay. Mean time in flip is
+dominated by waiting for vblank, not by the copy -- it tracks the refresh
+interval, not pixel count.
+
+Exit: 0 success, 1 error.
+EOF
+}
+
+have_counters() {
+	sysctl -n debug.nvrmfb_flip_n >/dev/null 2>&1
+}
+
+require_counters() {
+	if ! have_counters; then
+		echo "$me: debug.nvrmfb_* sysctls not present." >&2
+		echo "$me: the NVIDIA kext does not appear to be loaded." >&2
+		exit 1
+	fi
+}
+
+# Emit "name value" for every readable key, plus the wall clock.
+collect() {
+	echo "__epoch $(date +%s)"
+	for k in $COUNTERS $GAUGES; do
+		v=$(sysctl -n "$k" 2>/dev/null) || v=''
+		case $v in
+		'' | *[!0-9-]*) continue ;;
+		esac
+		echo "$k $v"
+		done
+}
+
+cmd_show() {
+	require_counters
+	collect | awk '
+	'"$AWK_COMMA"'
+	{ v[$1] = $2 }
+	END {
+		n = v["debug.nvrmfb_flip_n"]; s = v["debug.nvrmfb_flip_us_sum"]
+		printf "presentation counters (totals since boot)\n\n"
+		printf "  flips                  %s\n", comma(n)
+		if (n > 0) printf "  mean time in flip      %.2f ms\n", (s / n) / 1000
+		printf "  longest flip           %.2f ms\n", v["debug.nvrmfb_flip_us_max"] / 1000
+		printf "  longest latch wait     %.2f ms\n", v["debug.nvrmfb_flip_latch_max_us"] / 1000
+		printf "  latch waits            %s\n", comma(v["debug.nvrmfb_flip_latch_waits"])
+		printf "  late / deferred        %s / %s\n", \
+			comma(v["debug.nvrmfb_flip_latch_late"]), comma(v["debug.nvrmfb_flip_latch_deferred"])
+		printf "  latch timeouts         %s\n", comma(v["debug.nvrmfb_flip_latch_timeouts"])
+		printf "\n  flip_interval          %d%s\n", v["debug.nvrmfb_flip_interval"], \
+			(v["debug.nvrmfb_flip_interval"] >= 1 ? "   (vsync-locked)" : "   (unlocked)")
+		printf "  vram mapped            %.2f GiB\n", v["debug.nvrmfb_vram_mapped_bytes"] / 1073741824
+		printf "  vram budget            %.2f GiB\n", v["debug.nvrmfb_vram_budget_bytes"] / 1073741824
+		printf "\nTotals accumulate from boot and include desktop compositing.\n"
+		printf "Use \"begin\" and \"end\" to isolate one session.\n"
+	}'
+}
+
+cmd_begin() {
+	require_counters
+	collect >"$snapfile"
+	echo "$me: snapshot taken at $(date '+%Y-%m-%d %H:%M:%S')"
+	echo "$me: run '$me end' after the session."
+}
+
+cmd_end() {
+	require_counters
+	if [ ! -f "$snapfile" ]; then
+		echo "$me: no snapshot at $snapfile -- run '$me begin' first." >&2
+		exit 1
+	fi
+	collect >"$snapfile.now"
+
+	awk '
+	'"$AWK_COMMA"'
+	FNR == NR { a[$1] = $2; next }
+	{ b[$1] = $2 }
+	function d(k) { return b[k] - a[k] }
+	END {
+		secs = d("__epoch")
+		if (secs <= 0) secs = 1
+		flips  = d("debug.nvrmfb_flip_n")
+		inflip = d("debug.nvrmfb_flip_us_sum")
+
+		printf "session delta -- %d s elapsed\n\n", secs
+
+		if (flips <= 0) {
+			printf "  no flips recorded in this window.\n"
+			printf "  Either nothing presented, or the display is driven elsewhere.\n"
+			exit
+		}
+
+		printf "  flips                  %s\n", comma(flips)
+		printf "  mean flip rate         %.1f /s\n", flips / secs
+		printf "  mean time in flip      %.3f ms\n", (inflip / flips) / 1000
+		printf "  total time in flip     %.1f s of %d s  (%.1f%% of wall clock)\n", \
+			inflip / 1000000, secs, (inflip / 10000) / secs
+
+		late = d("debug.nvrmfb_flip_latch_late")
+		defr = d("debug.nvrmfb_flip_latch_deferred")
+		tmo  = d("debug.nvrmfb_flip_latch_timeouts")
+		printf "\n  latch waits            %s\n", comma(d("debug.nvrmfb_flip_latch_waits"))
+		printf "  late                   %s  (%.2f%% of flips)\n", comma(late), late * 100 / flips
+		printf "  deferred               %s  (%.2f%% of flips)\n", comma(defr), defr * 100 / flips
+		printf "  timeouts               %s\n", comma(tmo)
+
+		gr = d("debug.nvrmfb_vram_grants"); gb = d("debug.nvrmfb_vram_grant_bytes")
+		rl = d("debug.nvrmfb_vram_releases"); rb = d("debug.nvrmfb_vram_release_bytes")
+		printf "\n  vram grants            %s  (%.2f GiB)\n", comma(gr), gb / 1073741824
+		printf "  vram releases          %s  (%.2f GiB)\n", comma(rl), rb / 1073741824
+		if (flips > 0 && gb > 0)
+			printf "  grant bytes per flip   %s\n", comma(gb / flips)
+
+		isr = d("debug.nvrm_isr_count")
+		printf "\n  interrupts             %s  (%.0f /s)\n", comma(isr), isr / secs
+		printf "  event posts / waits    %s / %s\n", \
+			comma(d("debug.nvrm_evt_posts")), comma(d("debug.nvrm_evt_waits"))
+		printf "  pm waits               %s\n", comma(d("debug.nvrm_pm_waited"))
+
+		printf "\nMean flip rate is the figure to compare across runs: it counts\n"
+		printf "frames that actually reached the display, which is not what a\n"
+		printf "renderer-side FPS overlay reports.\n"
+		printf "\nMean time in flip is mostly a wait, not work. It tracks the\n"
+		printf "display refresh interval rather than pixel count -- measured at\n"
+		printf "57-67%% of one interval, where an even phase distribution alone\n"
+		printf "would give 50%%. Subtract half the refresh interval to estimate\n"
+		printf "the real cost of the copy.\n"
+		printf "\nRun-to-run variance on real gameplay is large: identical\n"
+		printf "settings have produced flip rates 29%% apart. Do not read a\n"
+		printf "single pair of runs as a result -- use a deterministic workload\n"
+		printf "such as demo playback, or take medians of several runs.\n"
+	}' "$snapfile" "$snapfile.now"
+
+	rm -f "$snapfile.now"
+}
+
+cmd_reset() {
+	rm -f "$snapfile" "$snapfile.now"
+	echo "$me: snapshot discarded"
+}
+
+cmd_keys() {
+	for k in $COUNTERS; do echo "counter  $k"; done
+	for k in $GAUGES; do echo "gauge    $k"; done
+}
+
+case ${1:-} in
+show) cmd_show ;;
+begin | start) cmd_begin ;;
+end | stop | delta) cmd_end ;;
+reset) cmd_reset ;;
+keys) cmd_keys ;;
+-h | --help | help | '') usage ;;
+*)
+	echo "$me: unknown command '$1'" >&2
+	usage >&2
+	exit 1
+	;;
+esac

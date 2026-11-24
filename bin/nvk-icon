@@ -1,0 +1,230 @@
+#!/bin/sh
+# nvk-icon -- find an icon for a generated launcher, and convert it to .icns.
+#
+#   nvk-icon sources [options]        every candidate found, best first
+#   nvk-icon find    [options]        just the best candidate's path
+#   nvk-icon make    <src> <dest>     write dest.icns from src (image or .icns)
+#   nvk-icon auto    <dest> [options] find, then make, in one step
+#
+# Options for sources / find / auto:
+#   --bottle NAME        the CrossOver bottle
+#   --bottle-dir DIR     where that bottle lives (repeatable)
+#   --name TEXT          the game's name, e.g. Deadlock
+#   --appid ID           its Steam appid, for the library cache
+#   --steam-root PATH    unix path to the Steam install inside the bottle
+#   --crossover PATH     CrossOver.app  (default /Applications/CrossOver.app)
+#
+# Where icons come from, in preference order:
+#
+#   1. CrossOver's own generated .app for the program. CrossOver extracts the
+#      real Windows icon when it creates those launchers and stores it as a
+#      multi-resolution .icns -- the best source available, and no conversion.
+#      It is always named CrossOverHelper.icns regardless of the program, so
+#      match on the .app's name, never the .icns file's.
+#   2. Steam's library cache artwork for the appid. Newer Steam keeps these in
+#      hash-named subdirectories, so search rather than assuming a layout.
+#      Needs conversion, and none of it is square.
+#
+# Squaring rule: pad artwork that has transparency (a logo keeps its whole
+# shape, and the padding stays transparent), centre-crop photographic artwork
+# (a vertical capsule would otherwise get large bars). Both via sips.
+#
+# Read-only except for the file `make` is told to write. Never needs sudo.
+#
+# Exit: 0 success, 1 error, 2 nothing found.
+
+set -u
+
+me=${0##*/}
+CX_APP=${NVK_CROSSOVER:-/Applications/CrossOver.app}
+BOTTLE=; BOTTLE_DIRS=; NAME=; APPID=; STEAM_ROOT=
+
+die()  { printf '%s: %s\n' "$me" "$*" >&2; exit 1; }
+warn() { printf '%s: %s\n' "$me" "$*" >&2; }
+usage() { sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+
+# ------------------------------------------------------------------ options ---
+
+parse_opts() {
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --bottle)      [ $# -ge 2 ] || die "--bottle needs a name";  BOTTLE=$2; shift 2 ;;
+      --bottle=*)    BOTTLE=${1#*=}; shift ;;
+      --bottle-dir)  [ $# -ge 2 ] || die "--bottle-dir needs a path"
+                     BOTTLE_DIRS="$BOTTLE_DIRS
+$2"; shift 2 ;;
+      --name)        [ $# -ge 2 ] || die "--name needs a value";   NAME=$2; shift 2 ;;
+      --name=*)      NAME=${1#*=}; shift ;;
+      --appid)       [ $# -ge 2 ] || die "--appid needs a value";  APPID=$2; shift 2 ;;
+      --appid=*)     APPID=${1#*=}; shift ;;
+      --steam-root)  [ $# -ge 2 ] || die "--steam-root needs a path"; STEAM_ROOT=$2; shift 2 ;;
+      --steam-root=*) STEAM_ROOT=${1#*=}; shift ;;
+      --crossover)   [ $# -ge 2 ] || die "--crossover needs a path"; CX_APP=$2; shift 2 ;;
+      --crossover=*) CX_APP=${1#*=}; shift ;;
+      -h|--help)     usage; exit 0 ;;
+      *)             die "unknown option $1" ;;
+    esac
+  done
+}
+
+# Case-insensitive fold, so "Deadlock" matches "deadlock.app".
+fold() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# ------------------------------------------------------------------ sources ---
+
+# Roots that might hold CrossOver's generated .app bundles. CrossOver puts them
+# beside the bottle directory when the bottles are relocated, and under
+# ~/Applications/CrossOver by default; nothing records the choice where we can
+# read it, so try both.
+cx_program_roots() {
+  oIFS=$IFS; IFS='
+'
+  for d in $BOTTLE_DIRS; do
+    IFS=$oIFS
+    [ -n "$d" ] || continue
+    parent=$(dirname "$d")
+    printf '%s\n' "$parent/Programs" "$parent"
+    IFS='
+'
+  done
+  IFS=$oIFS
+  printf '%s\n' \
+    "$HOME/Applications/CrossOver" \
+    "$HOME/Applications" \
+    "/Applications/CrossOver"
+}
+
+# A generated .app whose name matches the game. Searched one level deep (the
+# bottle subfolder) and at the root, since CrossOver uses both layouts.
+find_crossover_app() {
+  [ -n "$NAME$BOTTLE" ] || return 1
+  want=$(fold "${NAME:-$BOTTLE}")
+  cx_program_roots | while IFS= read -r root; do
+    [ -d "$root" ] || continue
+    for sub in "$root/$BOTTLE" "$root"; do
+      [ -d "$sub" ] || continue
+      for app in "$sub"/*.app; do
+        [ -d "$app" ] || continue
+        base=${app##*/}; base=${base%.app}
+        [ "$(fold "$base")" = "$want" ] || continue
+        icns=$(find "$app/Contents/Resources" -maxdepth 1 -name '*.icns' 2>/dev/null | head -1)
+        [ -n "$icns" ] || continue
+        printf 'crossover\t%s\n' "$icns"
+        return 0
+      done
+    done
+  done
+  return 0
+}
+
+# Steam's library cache. Preference order favours artwork that squares up well:
+# a transparent logo pads cleanly, a capsule crops acceptably, a wide header
+# crops poorly, and the loose hash .jpg is a 32px icon not worth having.
+STEAM_ART='logo.png library_capsule.jpg library_600x900.jpg library_header.jpg header.jpg library_hero.jpg'
+
+find_steam_art() {
+  [ -n "$APPID" ] && [ -n "$STEAM_ROOT" ] || return 0
+  cache="$STEAM_ROOT/appcache/librarycache/$APPID"
+  [ -d "$cache" ] || return 0
+  for want in $STEAM_ART; do
+    hit=$(find "$cache" -type f -name "$want" 2>/dev/null | head -1)
+    [ -n "$hit" ] && printf 'steam\t%s\n' "$hit"
+  done
+  return 0
+}
+
+cmd_sources() {
+  parse_opts "$@"
+  found=$( { find_crossover_app; find_steam_art; } )
+  [ -n "$found" ] || return 2
+  printf '%s\n' "$found"
+}
+
+cmd_find() {
+  parse_opts "$@"
+  best=$( { find_crossover_app; find_steam_art; } | head -1 )
+  [ -n "$best" ] || return 2
+  printf '%s\n' "$best" | cut -f2
+}
+
+# --------------------------------------------------------------- conversion ---
+
+# sips reports dimensions as trailing fields; take the last word of each line.
+img_dim() { sips -g "$1" "$2" 2>/dev/null | awk -v k="$1" '$1 == k":" { print $2 }'; }
+
+has_alpha() {
+  [ "$(sips -g hasAlpha "$1" 2>/dev/null | awk '$1 == "hasAlpha:" { print $2 }')" = yes ]
+}
+
+cmd_make() {
+  [ $# -eq 2 ] || die "usage: make <src> <dest.icns>"
+  src=$1; dest=$2
+  [ -f "$src" ] || die "no such file: $src"
+  case $dest in *.icns) ;; *) die "destination must end in .icns: $dest" ;; esac
+
+  # Already an .icns: copy it rather than round-tripping through sips, which
+  # would flatten the multi-resolution set CrossOver extracted.
+  case $(fold "$src") in
+    *.icns) cp "$src" "$dest" || die "could not copy $src"; printf '%s\n' "$dest"; return 0 ;;
+  esac
+
+  command -v sips >/dev/null 2>&1 || die "sips not found (expected at /usr/bin/sips)"
+  command -v iconutil >/dev/null 2>&1 || die "iconutil not found"
+
+  tmp=$(mktemp -d) || die "could not create a temporary directory"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+
+  w=$(img_dim pixelWidth "$src"); h=$(img_dim pixelHeight "$src")
+  case ${w:-}${h:-} in '' | *[!0-9]*) die "could not read the size of $src" ;; esac
+
+  sq="$tmp/square.png"
+  if [ "$w" -eq "$h" ]; then
+    sips -s format png "$src" --out "$sq" >/dev/null 2>&1 || die "sips failed on $src"
+  elif has_alpha "$src"; then
+    # Pad: keeps the whole logo, and the added margin stays transparent.
+    side=$w; [ "$h" -gt "$side" ] && side=$h
+    sips -s format png "$src" --out "$sq" >/dev/null 2>&1 || die "sips failed on $src"
+    sips -p "$side" "$side" "$sq" --out "$sq" >/dev/null 2>&1 \
+      || die "could not pad $src to square"
+  else
+    # Crop: a photographic capsule looks better centre-cropped than letterboxed.
+    side=$w; [ "$h" -lt "$side" ] && side=$h
+    sips -s format png "$src" --out "$sq" >/dev/null 2>&1 || die "sips failed on $src"
+    sips -c "$side" "$side" "$sq" --out "$sq" >/dev/null 2>&1 \
+      || die "could not crop $src to square"
+  fi
+
+  set="$tmp/icon.iconset"
+  mkdir -p "$set" || die "could not create $set"
+  # iconutil requires exactly these names.
+  for s in 16 32 128 256 512; do
+    sips -z "$s" "$s" "$sq" --out "$set/icon_${s}x${s}.png" >/dev/null 2>&1 \
+      || die "could not scale to ${s}x${s}"
+    d=$((s * 2))
+    sips -z "$d" "$d" "$sq" --out "$set/icon_${s}x${s}@2x.png" >/dev/null 2>&1 \
+      || die "could not scale to ${d}x${d}"
+  done
+
+  iconutil -c icns "$set" -o "$dest" >/dev/null 2>&1 || die "iconutil failed"
+  printf '%s\n' "$dest"
+}
+
+cmd_auto() {
+  [ $# -ge 1 ] || die "usage: auto <dest.icns> [options]"
+  dest=$1; shift
+  parse_opts "$@"
+  best=$( { find_crossover_app; find_steam_art; } | head -1 )
+  [ -n "$best" ] || return 2
+  src=$(printf '%s\n' "$best" | cut -f2)
+  cmd_make "$src" "$dest"
+}
+
+case ${1:-} in
+  sources) shift; cmd_sources "$@" ;;
+  find)    shift; cmd_find "$@" ;;
+  make)    shift; cmd_make "$@" ;;
+  auto)    shift; cmd_auto "$@" ;;
+  -h|--help|help) usage ;;
+  '')      usage >&2; exit 1 ;;
+  *)       printf '%s: unknown command %s\n' "$me" "$1" >&2; usage >&2; exit 1 ;;
+esac

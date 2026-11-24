@@ -6,7 +6,8 @@
 #   nvk-bottle path    <bottle>
 #   nvk-bottle status  <bottle>
 #   nvk-bottle setup   <bottle> [--d3d12] [--dlss] [--dyld] [--no-hud]
-#                               [--dxvk-config TEXT] [--yes]
+#                               [--hud LIST] [--dxvk-config TEXT]
+#                               [--log-level LEVEL] [--env KEY=VALUE]... [--yes]
 #   nvk-bottle run     <bottle> '<path\relative\to\drive_c.exe>' [args...]
 #   nvk-bottle undo    <bottle> [--yes]
 #
@@ -23,6 +24,19 @@
 #           launch from CrossOver's GUI / Steam's Play button with no script.
 #           (The runtime README advises against setting it globally; per-bottle
 #           is narrower, but if the bottle misbehaves, re-run without --dyld.)
+#           --hud and --log-level matter when recording a frame rate: DXVK's
+#           frametimes graph is its most expensive HUD element and info-level
+#           logging writes continuously. The default pair (devinfo,fps,frametimes
+#           at log level info) is right for diagnosing and wrong for measuring.
+#           Use --hud fps --log-level none to keep a frame counter you can read
+#           without paying for the graph, or --no-hud for no overlay at all.
+#           --env puts an arbitrary variable in the managed block, repeatable.
+#           It is how the driver's own tuning knobs get tested -- the NVK,
+#           NVRM and WINE_NVK variables are listed by:
+#             strings -a /Library/GPUBundles/nvmtl/libvulkan_nouveau.dylib \
+#               | grep -E '^(NVK|NVRM)_[A-Z0-9_]+$' | sort -u
+#           Values may not contain a quote or backslash, since they are written
+#           into cxbottle.conf inside double quotes.
 # run     - launches one app with the environment set explicitly. Always works,
 #           even without --dyld.
 # undo    - restores the prefix and the backed-up cxbottle.conf.
@@ -52,8 +66,26 @@ MARK_OLD='# --- native NVK (managed by nvk-bottle.sh) ---'
 OWNED_KEYS='WINEDLLOVERRIDES DXVK_CONFIG DXVK_HUD DXVK_LOG_LEVEL WINEMSYNC DYLD_LIBRARY_PATH CX_GRAPHICS_BACKEND'
 
 die()  { printf 'nvk-bottle: %s\n' "$*" >&2; exit 1; }
+
+# Accumulate a --env KEY=VALUE pair. The value lands in cxbottle.conf inside
+# double quotes, so a quote or newline in it would corrupt the file.
+add_env() {
+  case $1 in
+    *=*) ;;
+    *) die "--env expects KEY=VALUE, got '$1'" ;;
+  esac
+  _k=${1%%=*}; _v=${1#*=}
+  case $_k in
+    '' | *[!A-Za-z0-9_]* ) die "--env key must be alphanumeric/underscore: '$_k'" ;;
+  esac
+  case $_v in
+    *'"'* | *'\'* ) die "--env value may not contain a quote or backslash: '$_v'" ;;
+  esac
+  extraenv="$extraenv$_k=$_v
+"
+}
 warn() { printf 'nvk-bottle: %s\n' "$*" >&2; }
-usage() { sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
 
 [ "$(id -u)" = 0 ] && die "do not run this as root; nothing here needs sudo"
 
@@ -141,16 +173,24 @@ confirm() {
 
 # ------------------------------------------------------------ config edit ---
 
-env_block() { # $1 d3d12  $2 dyld  $3 hud  $4 dxvk_config
+env_block() { # $1 d3d12  $2 dyld  $3 hud  $4 dxvk_config  $5 log_level  $6 extra
   printf '%s\n' "$MARK"
+  # Extra vars go inside the sentinel block, so a re-run replaces them wholesale
+  # and they never need to join OWNED_KEYS.
+  if [ -n "${6:-}" ]; then
+    printf '%s\n' "$6" | while IFS= read -r _line; do
+      [ -n "$_line" ] || continue
+      printf '"%s" = "%s"\n' "${_line%%=*}" "${_line#*=}"
+    done
+  fi
   if [ "$1" = yes ]; then
     printf '"WINEDLLOVERRIDES" = "d3d11,dxgi,d3d12,d3d12core=n"\n'
   else
     printf '"WINEDLLOVERRIDES" = "d3d11,dxgi=n"\n'
   fi
   [ -n "$4" ] && printf '"DXVK_CONFIG" = "%s"\n' "$4"
-  [ "$3" = yes ] && printf '"DXVK_HUD" = "devinfo,fps,frametimes"\n'
-  printf '"DXVK_LOG_LEVEL" = "info"\n'
+  [ -n "$3" ] && printf '"DXVK_HUD" = "%s"\n' "$3"
+  printf '"DXVK_LOG_LEVEL" = "%s"\n' "${5:-info}"
   printf '"WINEMSYNC" = "1"\n'
   [ "$2" = yes ] && printf '"DYLD_LIBRARY_PATH" = "%s/lib"\n' "$RUNTIME"
   printf '%s\n' "$MARK"
@@ -178,14 +218,26 @@ clean_conf() {
 
 cmd_setup() {
   bottle=$1; shift
-  want12=no; wantdyld=no; wantdlss=no; wanthud=yes
+  want12=no; wantdyld=no; wantdlss=no; loglevel=info
+  hud='devinfo,fps,frametimes'
   dxvkcfg='dxvk.enableDescriptorBuffer = False'
+  extraenv=
   while [ $# -gt 0 ]; do
     case $1 in
       --d3d12) want12=yes; shift ;;
       --dlss)  wantdlss=yes; shift ;;
       --dyld)  wantdyld=yes; shift ;;
-      --no-hud) wanthud=no; shift ;;
+      --no-hud) hud=''; shift ;;
+      --hud) [ $# -ge 2 ] || die "--hud needs a value"; hud=$2; shift 2 ;;
+      --hud=*) hud=${1#*=}; shift ;;
+      --env)
+        [ $# -ge 2 ] || die "--env needs KEY=VALUE"
+        add_env "$2"; shift 2 ;;
+      --env=*) add_env "${1#*=}"; shift ;;
+      --log-level)
+        [ $# -ge 2 ] || die "--log-level needs a value"
+        loglevel=$2; shift 2 ;;
+      --log-level=*) loglevel=${1#*=}; shift ;;
       --dxvk-config) [ $# -ge 2 ] || die "--dxvk-config needs a value"; dxvkcfg=$2; shift 2 ;;
       --dxvk-config=*) dxvkcfg=${1#*=}; shift ;;
       --yes|-y) ASSUME_YES=yes; shift ;;
@@ -232,7 +284,7 @@ cmd_setup() {
   tmp=$(mktemp) || die "could not create a temporary file"
   clean_conf < "$conf" > "$tmp" || { rm -f "$tmp"; die "failed to rewrite $conf"; }
   grep -q '^\[EnvironmentVariables\]' "$tmp" || printf '\n[EnvironmentVariables]\n' >> "$tmp"
-  env_block "$want12" "$wantdyld" "$wanthud" "$dxvkcfg" >> "$tmp" \
+  env_block "$want12" "$wantdyld" "$hud" "$dxvkcfg" "$loglevel" "$extraenv" >> "$tmp" \
     || { rm -f "$tmp"; die "failed to build the environment block"; }
   cat "$tmp" > "$conf" && rm -f "$tmp" || { rm -f "$tmp"; die "failed to write $conf"; }
 

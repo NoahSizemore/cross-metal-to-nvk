@@ -33,7 +33,13 @@
 #   needs_steam   yes/no -- start Steam first and wait for it
 #   steam_app     Windows path to steam.exe, when it is not the default
 #   dxvk_config   DXVK_CONFIG contents for this game
+#   env           native (NVK/NVRM) variables the launcher exports, as
+#                 KEY=VALUE pairs separated by semicolons. These cannot go in
+#                 cxbottle.conf: it only reaches Windows-side code, while the
+#                 NVK dylib reads getenv() from the Unix environment.
 #   icon_from     an .app or directory to lift an .icns from
+#   outdir        where the launcher was installed, so --regenerate-all can
+#                 put it back there rather than in the default directory
 #   app_name      the generated launcher's name, if not "<name> (NVK)"
 #   anticheat     anticheat this game ships, if any -- a warning, not a block
 #   notes         free text worth passing to the next person
@@ -51,7 +57,7 @@ PROFILE_DIR=
 NL='
 '
 die() { printf 'nvk-profile: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 default_dir() {
@@ -60,7 +66,7 @@ default_dir() {
   printf '%s' "$HERE/../profiles"
 }
 
-KNOWN_KEYS='schema appid name installdir bottle bottle_dir exe_win exe_unix args needs_steam steam_app dxvk_config icon_from app_name anticheat notes'
+KNOWN_KEYS='schema appid name installdir bottle bottle_dir exe_win exe_unix args needs_steam steam_app dxvk_config env icon_from outdir app_name anticheat notes'
 
 # Read one key. Last definition wins, so an appended edit overrides an earlier
 # line without the file having to be rewritten.

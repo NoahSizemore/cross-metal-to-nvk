@@ -157,7 +157,13 @@ Launchers land in `~/Applications` and log to `~/Library/Logs/nvk-<name>.log`.
   re-run `setup` without it.
 * `nvk-mkapp --needs-steam` starts Steam first and waits for it. This is a
   convenience that may not work everywhere — prefer the two-app split.
-* `nvk-mkapp --icon-from '/path/to/some.app'` borrows an icon.
+* **Icons are found automatically.** `nvk-mkapp` asks `nvk-icon` for one when
+  `--icon-from` is not given: first the `.icns` CrossOver extracted from the
+  real executable (`CrossOver/Programs/<bottle>/<Game>.app`), then Steam's
+  library artwork for the appid, converted with `sips` and `iconutil`. Both
+  ship with macOS, so there is nothing to install.
+* `nvk-mkapp --icon-from '/path/to/some.app'` overrides that with a specific
+  icon. `nvk-icon sources ...` lists every candidate it found, best first.
 * `nvk-mkapp --regenerate-all` rebuilds every launcher from `profiles/`. Run it
   after a runtime or CrossOver update, since generated launchers pin their
   paths (design rule 6) and therefore go stale.
@@ -197,22 +203,97 @@ elevated processes.
 
 ## Performance
 
-One measured data point: **Deadlock**, RTX 4070, low settings, FSR2 2x —
-**35–130 fps**, 20,299 frames in a single session. Playable, and well short of
-the same card on Windows.
+One measured data point: **Deadlock**, RTX 4070, FSR2 2x, 1920×1080 — **88
+frames per second actually presented**, read from the kext's own counters. The
+in-game overlay reported 45–195 fps across the same session; the gap is frames
+rendered and then discarded.
 
-Three known causes, in rough order of cost:
+**Quality settings are effectively free.** Ultra preset produced the same
+frame-rate bounds as low, at no measurable cost, so GPU shading is not the
+limiting factor. Run it on Ultra.
+
+**Turn on the driver's experimental features.** Three of them are off by default
+and measurably help; this is the single most effective change available:
+
+```sh
+sudo /Library/NullMoth/nullmoth-setup.sh --experimental gameprio,tile,tgp
+```
+
+* `gameprio` — the one unambiguous win. Frame-time spikes fell from 41 ms to
+  10–15 ms and mean frame time by 27%, against a known-off baseline.
+* `tgp` — enables TGP power management, which ships **off**, so the GPU boost
+  daemon has no framework to act through without it. Needs a reboot.
+* `tile` — tiled shading.
+
+`tgp` and `tile` each *cost* light-scene frame time relative to `gameprio` alone
+and pay it back in heavy scenes (40–43 fps, noticeably steadier, against roughly
+37–38 at baseline). Whether that trade is worthwhile is **not settled** — heavy
+scenes were never measured with `gameprio` by itself. If you are reproducing
+this, measure that case and you will know more than we do.
+
+Do **not** enable `icb`. It drives GPU utilisation to ~97% while making both
+frame time and fps *worse* — a busier GPU doing less useful work. Utilisation is
+only meaningful read alongside frame time, never on its own.
+
+That script — `/Library/NullMoth/nullmoth-setup.sh`, part of the driver, not
+this project — is the driver's own tuning surface and is undocumented in its
+README. `--gpu-boost`, `--game-mode` and `--experimental` all live there, and
+most of it ships off.
+
+There are two regimes, with different limits:
+
+| Scene | Frame time | GPU load | Limited by |
+|---|---|---|---|
+| light geometry | ~3–4 ms | 50–60% | CPU / submission — the GPU is idling |
+| dense geometry | up to ~20 ms | ~100% | GPU, scaling with draw count |
+
+Frame cost tracks **how many things are drawn**, not how expensive they are to
+shade and not how many pixels they cover — reducing render resolution and
+changing upscalers both measured as no-ops. That is a per-draw cost, which is
+why it shows up on the CPU in one regime and the GPU in the other.
+
+What actually limits it, in rough order:
 
 1. **Framebuffer compression is refused on every render target.** The driver
-   logs `unsupported pte_kind` and falls back uncompressed. Likely the single
-   biggest fixable item.
-2. **One full-frame GPU copy per present.** Measured at exactly
-   2560×1440×4 bytes per frame; presentation is not zero-copy. Lowering
-   resolution attacks this directly.
-3. **DXVK's own D3D11→Vulkan overhead.**
+   logs `unsupported pte_kind` and falls back uncompressed — a constant tax on
+   all render-target traffic, which is the binding constraint here.
+2. **DXVK runs on its legacy binding model**, because
+   `VK_EXT_descriptor_buffer` is not available. Draw calls and descriptor-set
+   counts both rise with scene detail, and frame time rises with them.
+3. **Scene-transition spikes of 100–150 ms** from pipeline creation, even with
+   the Mesa shader cache warm.
+4. **Most rendered frames never reach the display.** An application asking for
+   `IMMEDIATE` is told it was granted, then gets vsync behaviour, and the
+   discarded frames are not reported anywhere it can see them.
+5. **One full-frame GPU copy per present.** Measured at exactly
+   2560×1440×4 bytes per frame; presentation is not zero-copy. Once timed, its
+   direct cost is only ~0.4–0.5 ms per frame, so it ranks lower than it looks.
+   Note it tracks the **desktop** resolution, not the game's — a game set to
+   1080p on a 1440p desktop still presents a 1440p swapchain.
 
-See [docs/DRIVER-ISSUES.md](docs/DRIVER-ISSUES.md) for the full write-ups,
-including two driver bugs that cause silent visual corruption.
+What actually helped, measured: dropping to 1920×1080 roughly doubled the
+frame-rate floor. Lowering the display refresh rate made things worse. **No
+graphics or DXVK setting tested has produced an effect distinguishable from
+noise** — identical configurations have produced results 35% apart on real
+gameplay, so read [CHANGELOG.md](CHANGELOG.md) before trusting any small
+improvement, including your own.
+
+Three things worth knowing before you tune:
+
+* **`-vulkan` does not work.** Source 2's native Vulkan renderer would remove
+  DXVK from the chain, but swapchain creation fails. See
+  [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
+* **GPU clocks cannot be read on this stack.** No sysctl reports them. Check
+  that `-nvrmnopm` is absent from your boot-args, then use resolution scaling
+  as an indirect test.
+* **Do not judge a change by the FPS overlay.** It reports rendered frames, and
+  most of them are discarded before reaching the display. Use
+  `bin/nvk-flipstat`.
+
+`bin/nvk-flipstat begin` / `end` measures the presentation path around a
+session. See [docs/DRIVER-ISSUES.md](docs/DRIVER-ISSUES.md) for the full
+write-ups, including two driver bugs that cause silent visual corruption, and
+[CHANGELOG.md](CHANGELOG.md) for what has been ruled out.
 
 ---
 
@@ -222,7 +303,8 @@ including two driver bugs that cause silent visual corruption.
 |---|---|
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptoms, causes, fixes |
 | [docs/DRIVER-ISSUES.md](docs/DRIVER-ISSUES.md) | Upstream driver findings with reproduction detail |
-| [docs/upstream/](docs/upstream/) | The same three findings, written as reports ready to submit |
+| [docs/upstream/](docs/upstream/) | The same findings, written as reports ready to submit |
+| [CHANGELOG.md](CHANGELOG.md) | What changed, and what was measured or ruled out |
 | [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) | Per-game notes, anticheat, Steam launch caveats |
 | [profiles/README.md](profiles/README.md) | The profile format |
 | [tests/fixtures/README.md](tests/fixtures/README.md) | What the fixtures stand in for |
@@ -264,6 +346,12 @@ bin/
   nvk-winepath      drives / to-win / from-win, via the bottle's dosdevices
   nvk-profile       list / path / read / write / validate / name
   nvk-mkapp         generates .app launchers from a profile or from flags
+  nvk-icon          finds an icon for a launcher and converts it to .icns;
+                    nvk-mkapp calls it when --icon-from is not given
+  nvk-flipstat      reads the kext's presentation counters; begin/end deltas
+                    them around a session (read-only)
+  nvk-mdmp          reads a Windows minidump: exception, graphics modules, and
+                    the engine's own fatal-error report
   vk-icd-probe.py   enumerates the NVK ICD via ctypes; no Vulkan SDK needed
 profiles/           per-game profiles: the output of record (yours are
                     gitignored; they record your own paths)
@@ -324,8 +412,12 @@ nullintosh user can run. Current state and direction:
 - [x] Per-game profile format, and `nvk-mkapp --regenerate-all` to rebuild every
       launcher after a runtime or CrossOver update
 - [x] `nvk-setup`: a guided front door that runs the whole arc
-- [ ] File the driver findings upstream — written up ready to send in
-      [docs/upstream/](docs/upstream/), not yet submitted
+- [x] Automatic launcher icons, from CrossOver's extracted `.icns` or Steam's
+      library artwork (`nvk-icon`)
+- [x] Instrumentation that does not need a GPU vendor tool: `nvk-flipstat` for
+      presented frames, `nvk-mdmp` for reading crash dumps on macOS
+- [ ] File the driver findings upstream — six written up ready to send in
+      [docs/upstream/](docs/upstream/), none submitted
 - [ ] A second machine. Everything above is tested; *tested* here means against
       fixtures and one RTX 4070. See [Coverage](#coverage).
 
